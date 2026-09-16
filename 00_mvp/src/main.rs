@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 struct Node {
-    name: String,
+    path: PathBuf,
     size: u64,
     is_dir: bool,
     children: Vec<Node>,
@@ -15,17 +15,11 @@ struct Node {
 }
 
 // ----------------------------------------------------------------------------
-// 1. Filesystem Traversal (Gracefully ignores symlinks & permission errors)
+// 1. Filesystem Traversal
 // ----------------------------------------------------------------------------
 fn scan_tree(path: &Path) -> Node {
-    let name = path
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| path.display().to_string());
-
     let mut node = Node {
-        name,
+        path: path.to_path_buf(),
         size: 0,
         is_dir: true,
         children: Vec::new(),
@@ -50,8 +44,10 @@ fn scan_tree(path: &Path) -> Node {
                 continue;
             }
 
+            let entry_path = entry.path();
+
             if ft.is_dir() {
-                let child = scan_tree(&entry.path());
+                let child = scan_tree(&entry_path);
                 if child.size > 0 {
                     node.size += child.size;
                     node.children.push(child);
@@ -60,10 +56,9 @@ fn scan_tree(path: &Path) -> Node {
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 if size > 0 && size < (1 << 48) {
                     node.size += size;
-                    let name = entry.file_name().to_string_lossy().into_owned();
                     node.children.push(Node {
-                        color: color_for_name(&name),
-                        name,
+                        color: color_for_path(&entry_path),
+                        path: entry_path,
                         size,
                         is_dir: false,
                         children: Vec::new(),
@@ -90,12 +85,10 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
     let area_mult = (rect.w * rect.h) as f64 / total as f64;
     let areas: Vec<f64> = nodes.iter().map(|n| n.size as f64 * area_mult).collect();
 
-    let worst = |row: &[usize], extra: Option<usize>, sum: f64, side: f32| -> f64 {
+    let worst = |row: &[usize], sum: f64, side: f32| -> f64 {
         let (s2, sum2) = ((side * side) as f64, sum * sum);
         row.iter()
-            .copied()
-            .chain(extra)
-            .map(|i| (s2 * areas[i] / sum2).max(sum2 / (s2 * areas[i])))
+            .map(|&i| (s2 * areas[i] / sum2).max(sum2 / (s2 * areas[i])))
             .fold(0.0, f64::max)
     };
 
@@ -132,9 +125,9 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
         let mut next_row = row.clone();
         next_row.push(i);
 
-        let worst_with = worst(&row, Some(i), row_sum + areas[i], side);
-        let worst_without = worst(&row, None, row_sum, side);
-        if row.is_empty() || worst_with <= worst_without {
+        if row.is_empty()
+            || worst(&next_row, row_sum + areas[i], side) <= worst(&row, row_sum, side)
+        {
             row.push(i);
             row_sum += areas[i];
         } else {
@@ -150,14 +143,7 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
     // Recurse into directories
     for node in nodes.iter_mut() {
         if node.is_dir && node.rect.w > 4.0 && node.rect.h > 4.0 {
-            // Inset by 2 pixels so parent boundaries remain visible
-            let inner_rect = Rect::new(
-                node.rect.x + 1.0,
-                node.rect.y + 1.0,
-                node.rect.w - 2.0,
-                node.rect.h - 2.0,
-            );
-            squarify(&mut node.children, inner_rect);
+            squarify(&mut node.children, node.rect);
         }
     }
 }
@@ -200,22 +186,25 @@ fn render_tree(node: &Node, mouse: Vec2, hovered: &mut Option<String>) {
         );
     }
 
+    // Only assign hover text if a deeper child hasn't already claimed it
     if hovered.is_none() && node.rect.contains(mouse) {
-        *hovered = Some(format!("{} ({})", node.name, format_bytes(node.size)));
+        *hovered = Some(format!(
+            "{} ({})",
+            node.path.display(),
+            format_bytes(node.size)
+        ));
     }
 }
 
-fn color_for_name(name: &str) -> Color {
-    let ext = Path::new(name)
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or("");
+fn color_for_path(path: &Path) -> Color {
+    let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
     match ext {
-        "rs" | "c" | "cpp" | "py" | "js" | "txt" | "md" => Color::new(0.2, 0.75, 0.45, 1.0),
+        "rs" | "c" | "cpp" | "py" | "js" | "ts" | "txt" | "md" => Color::new(0.2, 0.75, 0.45, 1.0),
         "png" | "jpg" | "jpeg" | "svg" | "webp" => Color::new(0.2, 0.65, 0.95, 1.0),
         "mp4" | "mkv" | "mov" | "mp3" | "flac" => Color::new(0.75, 0.35, 0.85, 1.0),
         "zip" | "tar" | "gz" | "7z" => Color::new(0.9, 0.3, 0.25, 1.0),
         _ => {
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
             let h = name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
             Color::from_rgba(
                 (h * 37 % 160 + 80) as u8,
@@ -242,10 +231,13 @@ fn format_bytes(b: u64) -> String {
 // ----------------------------------------------------------------------------
 #[macroquad::main("Treemap Disk Visualizer MVP")]
 async fn main() {
-    let target = std::env::args()
+    let raw_target = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+
+    // Canonicalize to make sure target starts as a complete, absolute path
+    let target = fs::canonicalize(&raw_target).unwrap_or(raw_target);
     let (tx, rx): (std::sync::mpsc::Sender<Node>, Receiver<Node>) = channel();
 
     // Scan in background thread to prevent UI freezing
@@ -281,8 +273,9 @@ async fn main() {
 
             // Top Status Bar
             draw_rectangle(0.0, 0.0, screen_w, 36.0, Color::new(0.05, 0.06, 0.08, 0.95));
-            let header = hovered.unwrap_or_else(|| format!("Total: {}", format_bytes(tree.size)));
-            draw_text(&header, 14.0, 24.0, 18.0, WHITE);
+            let header = hovered
+                .unwrap_or_else(|| format!("{}: {}", tree.path.display(), format_bytes(tree.size)));
+            draw_text(&header, 14.0, 24.0, 16.0, WHITE);
         } else {
             draw_text("Scanning filesystem...", 20.0, 40.0, 24.0, LIGHTGRAY);
         }
