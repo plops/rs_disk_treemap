@@ -92,7 +92,7 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
             .fold(0.0, f64::max)
     };
 
-    let mut layout_row = |nodes: &mut [Node], row: &[usize], sum: f64, r: &mut Rect| {
+    let layout_row = |nodes: &mut [Node], row: &[usize], sum: f64, r: &mut Rect| {
         let side = r.w.min(r.h);
         let thickness = (sum / side as f64) as f32;
         let is_horiz = r.w < r.h;
@@ -164,8 +164,8 @@ fn render_tree(node: &Node, mouse: Vec2, hovered: &mut Option<String>) {
         draw_rectangle_lines(node.rect.x, node.rect.y, node.rect.w, node.rect.h, 1.0, Color::new(0., 0., 0., 0.6));
     }
 
-    if node.rect.contains(mouse) {
-        *hovered = Some(format!("{} ({})", node.name, format_bytes(node.size)));
+    if hovered.is_none() && node.rect.contains(mouse) {
+       *hovered = Some(format!("{} ({})", node.name, format_bytes(node.size)));
     }
 }
 
