@@ -2,7 +2,7 @@ use macroquad::prelude::*;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 struct Node {
@@ -18,7 +18,12 @@ struct Node {
 // 1. Filesystem Traversal (Gracefully ignores symlinks & permission errors)
 // ----------------------------------------------------------------------------
 fn scan_tree(path: &Path) -> Node {
-    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let name = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| path.display().to_string());
+
     let mut node = Node {
         name,
         size: 0,
@@ -85,10 +90,12 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
     let area_mult = (rect.w * rect.h) as f64 / total as f64;
     let areas: Vec<f64> = nodes.iter().map(|n| n.size as f64 * area_mult).collect();
 
-    let worst = |row: &[usize], sum: f64, side: f32| -> f64 {
+    let worst = |row: &[usize], extra: Option<usize>, sum: f64, side: f32| -> f64 {
         let (s2, sum2) = ((side * side) as f64, sum * sum);
         row.iter()
-            .map(|&i| (s2 * areas[i] / sum2).max(sum2 / (s2 * areas[i])))
+            .copied()
+            .chain(extra)
+            .map(|i| (s2 * areas[i] / sum2).max(sum2 / (s2 * areas[i])))
             .fold(0.0, f64::max)
     };
 
@@ -125,7 +132,9 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
         let mut next_row = row.clone();
         next_row.push(i);
 
-        if row.is_empty() || worst(&next_row, row_sum + areas[i], side) <= worst(&row, row_sum, side) {
+        let worst_with = worst(&row, Some(i), row_sum + areas[i], side);
+        let worst_without = worst(&row, None, row_sum, side);
+        if row.is_empty() || worst_with <= worst_without {
             row.push(i);
             row_sum += areas[i];
         } else {
@@ -141,7 +150,14 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
     // Recurse into directories
     for node in nodes.iter_mut() {
         if node.is_dir && node.rect.w > 4.0 && node.rect.h > 4.0 {
-            squarify(&mut node.children, node.rect);
+            // Inset by 2 pixels so parent boundaries remain visible
+            let inner_rect = Rect::new(
+                node.rect.x + 1.0,
+                node.rect.y + 1.0,
+                node.rect.w - 2.0,
+                node.rect.h - 2.0,
+            );
+            squarify(&mut node.children, inner_rect);
         }
     }
 }
@@ -155,22 +171,45 @@ fn render_tree(node: &Node, mouse: Vec2, hovered: &mut Option<String>) {
     }
 
     if node.children.is_empty() {
-        draw_rectangle(node.rect.x, node.rect.y, node.rect.w, node.rect.h, node.color);
-        draw_rectangle_lines(node.rect.x, node.rect.y, node.rect.w, node.rect.h, 1.0, Color::new(0., 0., 0., 0.35));
+        draw_rectangle(
+            node.rect.x,
+            node.rect.y,
+            node.rect.w,
+            node.rect.h,
+            node.color,
+        );
+        draw_rectangle_lines(
+            node.rect.x,
+            node.rect.y,
+            node.rect.w,
+            node.rect.h,
+            1.0,
+            Color::new(0., 0., 0., 0.35),
+        );
     } else {
         for child in &node.children {
             render_tree(child, mouse, hovered);
         }
-        draw_rectangle_lines(node.rect.x, node.rect.y, node.rect.w, node.rect.h, 1.0, Color::new(0., 0., 0., 0.6));
+        draw_rectangle_lines(
+            node.rect.x,
+            node.rect.y,
+            node.rect.w,
+            node.rect.h,
+            1.0,
+            Color::new(0., 0., 0., 0.6),
+        );
     }
 
     if hovered.is_none() && node.rect.contains(mouse) {
-       *hovered = Some(format!("{} ({})", node.name, format_bytes(node.size)));
+        *hovered = Some(format!("{} ({})", node.name, format_bytes(node.size)));
     }
 }
 
 fn color_for_name(name: &str) -> Color {
-    let ext = Path::new(name).extension().and_then(OsStr::to_str).unwrap_or("");
+    let ext = Path::new(name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("");
     match ext {
         "rs" | "c" | "cpp" | "py" | "js" | "txt" | "md" => Color::new(0.2, 0.75, 0.45, 1.0),
         "png" | "jpg" | "jpeg" | "svg" | "webp" => Color::new(0.2, 0.65, 0.95, 1.0),
@@ -178,7 +217,12 @@ fn color_for_name(name: &str) -> Color {
         "zip" | "tar" | "gz" | "7z" => Color::new(0.9, 0.3, 0.25, 1.0),
         _ => {
             let h = name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
-            Color::from_rgba((h * 37 % 160 + 80) as u8, (h * 59 % 160 + 80) as u8, (h * 83 % 160 + 80) as u8, 255)
+            Color::from_rgba(
+                (h * 37 % 160 + 80) as u8,
+                (h * 59 % 160 + 80) as u8,
+                (h * 83 % 160 + 80) as u8,
+                255,
+            )
         }
     }
 }
@@ -198,7 +242,10 @@ fn format_bytes(b: u64) -> String {
 // ----------------------------------------------------------------------------
 #[macroquad::main("Treemap Disk Visualizer MVP")]
 async fn main() {
-    let target = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let target = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let (tx, rx): (std::sync::mpsc::Sender<Node>, Receiver<Node>) = channel();
 
     // Scan in background thread to prevent UI freezing
@@ -220,7 +267,7 @@ async fn main() {
         }
 
         if let Some(tree) = &mut root {
-            let canvas = Rect::new(0.0, 36.0, screen_w, screen_h - 36.0);
+            let canvas = Rect::new(0.0, 36.0, screen_w, (screen_h - 36.0).max(1.0));
 
             // Recompute layout only when the window is resized
             if (screen_w, screen_h) != last_size {
