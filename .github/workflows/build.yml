@@ -1,8 +1,9 @@
-name: Build MVP
+name: Build & Release
 
 on:
   push:
     branches: [ "main", "master" ]
+    tags: [ "v*" ] # Triggers release workflow on version tags (e.g., v1.0.0)
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
@@ -10,24 +11,34 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Required to allow the workflow to create and upload assets to GitHub Releases
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build ${{ matrix.project.name }} (${{ matrix.os_name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
+        project:
+          # Configuration for the MVP project
+          - dir: 00_mvp
+            name: treemap_mvp
+            bin: treemap_mvp
+          # Configuration for the advanced project
+          - dir: 01_more
+            name: treemap-disk-analyzer
+            bin: treemap-disk-analyzer
         include:
           - os: ubuntu-latest
-            artifact_name: treemap_mvp-linux
-            binary_pattern: 00_mvp/target/release/treemap_mvp
+            os_name: linux
+            ext: ""
           - os: windows-latest
-            artifact_name: treemap_mvp-windows
-            binary_pattern: 00_mvp/target/release/treemap_mvp.exe
-
-    defaults:
-      run:
-        working-directory: 00_mvp
+            os_name: windows
+            ext: ".exe"
 
     steps:
       - name: Checkout repository
@@ -46,14 +57,29 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "00_mvp -> target"
+          workspaces: "${{ matrix.project.dir }} -> target"
 
       - name: Build release binary
+        working-directory: ${{ matrix.project.dir }}
         run: cargo build --release
 
-      - name: Upload Artifact
+      - name: Rename binary for distribution
+        shell: bash
+        run: |
+          cd ${{ matrix.project.dir }}/target/release/
+          mv ${{ matrix.project.bin }}${{ matrix.ext }} ${{ matrix.project.bin }}-${{ matrix.os_name }}${{ matrix.ext }}
+
+      - name: Upload Artifact (CI)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.binary_pattern }}
+          name: ${{ matrix.project.name }}-${{ matrix.os_name }}
+          path: ${{ matrix.project.dir }}/target/release/${{ matrix.project.bin }}-${{ matrix.os_name }}${{ matrix.ext }}
           if-no-files-found: warn
+
+      - name: Publish to GitHub Release
+        # Only run this step if a tag starting with 'v' was pushed
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          # This action will automatically create a release if it doesn't exist for the tag
+          files: ${{ matrix.project.dir }}/target/release/${{ matrix.project.bin }}-${{ matrix.os_name }}${{ matrix.ext }}
