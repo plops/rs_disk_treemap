@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // 1. Data Structures (Memory Optimized: No PathBuf per leaf)
@@ -282,6 +282,13 @@ fn squarify_children(node: &mut FileNode) {
     }
 }
 
+fn collapse_descendants(node: &mut FileNode, rect: Rect) {
+    for child in &mut node.children {
+        child.target_rect = rect;
+        collapse_descendants(child, rect);
+    }
+}
+
 /// Recursive parallel layout using Rayon + 1px Visual Inset for folder hierarchy
 pub fn layout_treemap_parallel(node: &mut FileNode) {
     if node.children.is_empty() || node.size_bytes == 0 {
@@ -290,14 +297,17 @@ pub fn layout_treemap_parallel(node: &mut FileNode) {
 
     squarify_children(node);
 
-    // Parallel recursive descent with 1px container padding (Visual Nesting)
-    let eligible_subdirs: Vec<&mut FileNode> = node
+    // Filter children into those that can be visually nested vs collapsed
+    let (eligible_subdirs, too_small): (Vec<&mut FileNode>, Vec<&mut FileNode>) = node
         .children
         .iter_mut()
-        .filter(|c| {
-            c.is_dir && !c.children.is_empty() && c.target_rect.w >= 6.0 && c.target_rect.h >= 6.0
-        })
-        .collect();
+        .filter(|c| c.is_dir && !c.children.is_empty())
+        .partition(|c| c.target_rect.w >= 6.0 && c.target_rect.h >= 6.0 && c.size_bytes > 0);
+
+    for child in too_small {
+        let r = child.target_rect;
+        collapse_descendants(child, r);
+    }
 
     eligible_subdirs.into_par_iter().for_each(|child| {
         child.target_rect = Rect::new(
@@ -417,30 +427,19 @@ fn start_fs_watcher(
 ) -> Option<notify::RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
-            match event.kind {
-                EventKind::Modify(_) | EventKind::Create(_) => {
-                    for path in event.paths {
-                        let _ = tx.send(FileChangeEvent {
-                            path,
-                            is_removal: false,
-                        });
-                    }
-                }
-                EventKind::Remove(_) => {
-                    for path in event.paths {
-                        let _ = tx.send(FileChangeEvent {
-                            path,
-                            is_removal: true,
-                        });
-                    }
-                }
-                _ => {}
+            // Ignore access events, forward everything else robustly
+            if matches!(event.kind, EventKind::Access(_)) {
+                return;
+            }
+            for path in event.paths {
+                let is_removal = matches!(event.kind, EventKind::Remove(_));
+                let _ = tx.send(FileChangeEvent { path, is_removal });
             }
         }
     })
     .ok()?;
 
-    let _ = watcher.watch(&root_path, RecursiveMode::Recursive);
+    let _ = watcher.watch(&root_path, RecursiveMode::Recursive).ok()?;
     Some(watcher)
 }
 
@@ -448,20 +447,39 @@ fn start_fs_watcher(
 // 5. Rendering, Spring Animation & Non-Overwriting Hover Detection
 // ============================================================================
 
-fn update_animations(node: &mut FileNode, dt: f32) {
-    let t = 1.0 - (-14.0 * dt).exp(); // Exponential smoothing
+fn update_animations(node: &mut FileNode, dt: f32) -> bool {
+    let mut still_anim = false;
 
-    node.current_rect.x += (node.target_rect.x - node.current_rect.x) * t;
-    node.current_rect.y += (node.target_rect.y - node.current_rect.y) * t;
-    node.current_rect.w += (node.target_rect.w - node.current_rect.w) * t;
-    node.current_rect.h += (node.target_rect.h - node.current_rect.h) * t;
+    if (node.target_rect.x - node.current_rect.x).abs() > 0.1
+        || (node.target_rect.y - node.current_rect.y).abs() > 0.1
+        || (node.target_rect.w - node.current_rect.w).abs() > 0.1
+        || (node.target_rect.h - node.current_rect.h).abs() > 0.1
+    {
+        let t = 1.0 - (-14.0 * dt).exp();
+        node.current_rect.x += (node.target_rect.x - node.current_rect.x) * t;
+        node.current_rect.y += (node.target_rect.y - node.current_rect.y) * t;
+        node.current_rect.w += (node.target_rect.w - node.current_rect.w) * t;
+        node.current_rect.h += (node.target_rect.h - node.current_rect.h) * t;
+        still_anim = true;
+    } else {
+        node.current_rect = node.target_rect; // Snap exactly
+    }
 
     if node.growth_pulse > 0.0 {
         node.growth_pulse = (node.growth_pulse - dt * 1.5).max(0.0);
+        still_anim |= node.growth_pulse > 0.001;
     }
 
     for child in &mut node.children {
-        update_animations(child, dt);
+        still_anim |= update_animations(child, dt);
+    }
+    still_anim
+}
+
+fn snap_tree(node: &mut FileNode) {
+    node.current_rect = node.target_rect;
+    for child in &mut node.children {
+        snap_tree(child);
     }
 }
 
@@ -684,6 +702,10 @@ fn window_conf() -> Conf {
         window_width: 1280,
         window_height: 720,
         high_dpi: true,
+        platform: macroquad::miniquad::conf::Platform {
+            swap_interval: Some(1), // Lock to vsync
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -734,7 +756,10 @@ async fn main() {
     let mut camera_pos = Vec2::ZERO;
     let mut camera_zoom = 1.0f32;
     let mut last_mouse = Vec2::ZERO;
+    
     let mut layout_dirty = true;
+    let mut is_animating = true;
+    let mut last_layout_time = Instant::now();
 
     loop {
         let dt = get_frame_time().min(0.05);
@@ -742,6 +767,7 @@ async fn main() {
         let screen_h = screen_height();
         // Safe canvas computation (prevents negative dimensions when window is minimized)
         let world_canvas = Rect::new(0.0, 44.0, screen_w, (screen_h - 44.0).max(1.0));
+        let mut input_active = false;
 
         // 1. Drain progressive scan batches from worker thread
         while let Ok(event) = scan_rx.try_recv() {
@@ -765,29 +791,56 @@ async fn main() {
             }
         }
 
-        // 2. Drain live inotify file changes
+        // 2. Drain live inotify file changes, rely on OS fs state rather than event enum alone
         let now = Instant::now();
         while let Ok(change) = watch_rx.try_recv() {
             if let Ok(rel) = change.path.strip_prefix(&target_dir) {
                 let components: Vec<&OsStr> = rel.iter().collect();
-                if change.is_removal {
-                    if let Some(parent_comps) = components.split_last().map(|(_, p)| p) {
-                        if let Some(parent) = root_node.find_mut(parent_comps) {
-                            if let Some(file_name) = components.last() {
-                                let name = file_name.to_string_lossy();
-                                if let Some(pos) =
-                                    parent.children.iter().position(|c| c.name == name)
-                                {
-                                    let removed = parent.children.remove(pos);
-                                    total_files.fetch_sub(1, Ordering::Relaxed);
-                                    total_bytes.fetch_sub(removed.size_bytes, Ordering::Relaxed);
-                                    layout_dirty = true;
-                                }
-                            }
+                if components.is_empty() { continue; } // Exclude root alterations from this logic
+
+                let parent_comps = &components[..components.len() - 1];
+                let item_name = components.last().unwrap().to_string_lossy();
+                let is_exists = change.path.exists();
+                let is_removal = change.is_removal || !is_exists;
+
+                if is_removal {
+                    if let Some(parent) = root_node.find_mut(parent_comps) {
+                        if let Some(pos) = parent.children.iter().position(|c| c.name == item_name) {
+                            let removed = parent.children.remove(pos);
+                            total_files.fetch_sub(1, Ordering::Relaxed);
+                            total_bytes.fetch_sub(removed.size_bytes, Ordering::Relaxed);
+                            layout_dirty = true;
                         }
                     }
                 } else if let Ok(meta) = fs::metadata(&change.path) {
-                    if meta.is_file() {
+                    if meta.is_dir() {
+                        if let Some(parent) = root_node.find_mut(parent_comps) {
+                            if !parent.children.iter().any(|c| c.name == item_name) {
+                                // Do a real immediate local scan of this new dir
+                                let mut new_dir = FileNode::new(item_name.into_owned(), true, 0);
+                                if let Ok(entries) = fs::read_dir(&change.path) {
+                                    for e in entries.flatten() {
+                                        if let Ok(ft) = e.file_type() {
+                                            if ft.is_symlink() { continue; } // prevent loops
+                                            let name = e.file_name().to_string_lossy().into_owned();
+                                            if ft.is_dir() {
+                                                new_dir.children.push(FileNode::new(name, true, 0));
+                                            } else if ft.is_file() {
+                                                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                                                if size <= (1 << 48) {
+                                                    total_files.fetch_add(1, Ordering::Relaxed);
+                                                    total_bytes.fetch_add(size, Ordering::Relaxed);
+                                                    new_dir.children.push(FileNode::new(name, false, size));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                parent.children.push(new_dir);
+                                layout_dirty = true;
+                            }
+                        }
+                    } else if meta.is_file() {
                         let new_size = meta.len();
                         if let Some(diff) = root_node.update_file_size(&components, new_size, now) {
                             if diff != 0 {
@@ -798,14 +851,23 @@ async fn main() {
                                 }
                                 layout_dirty = true;
                             }
+                        } else {
+                            // Target wasn't found - insert the new file
+                            if let Some(parent) = root_node.find_mut(parent_comps) {
+                                total_files.fetch_add(1, Ordering::Relaxed);
+                                total_bytes.fetch_add(new_size, Ordering::Relaxed);
+                                parent.children.push(FileNode::new(item_name.into_owned(), false, new_size));
+                                layout_dirty = true;
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 3. Parallel Treemap Recalculation (Rayon)
-        if layout_dirty {
+        // 3. Parallel Treemap Recalculation (Rayon) debounced by 100ms when scanning 
+        let scanning = is_scanning.load(Ordering::Relaxed);
+        if layout_dirty && (!scanning || last_layout_time.elapsed().as_millis() > 100) {
             root_node.target_rect = world_canvas;
 
             fn sum_tree_bytes(node: &mut FileNode) -> u64 {
@@ -820,17 +882,27 @@ async fn main() {
 
             layout_treemap_parallel(&mut root_node);
             layout_dirty = false;
+            is_animating = true;
+            last_layout_time = Instant::now();
         }
 
-        // 4. Update spring lerps & animations
-        update_animations(&mut root_node, dt);
+        // 4. Update spring lerps & animations tracking
+        if scanning {
+            snap_tree(&mut root_node);
+        } else if is_animating {
+            is_animating = update_animations(&mut root_node, dt);
+        }
 
         // 5. Input Handling: Pan, Zoom, Reset
         let mouse_screen = Vec2::from(mouse_position());
+        if mouse_screen != last_mouse {
+            input_active = true;
+        }
 
         if is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Middle) {
             let delta = (mouse_screen - last_mouse) / camera_zoom;
             camera_pos += delta;
+            input_active = true;
         }
         last_mouse = mouse_screen;
 
@@ -845,11 +917,13 @@ async fn main() {
             camera_zoom = camera_zoom.clamp(0.05, 100.0);
             let mouse_world_after = (mouse_screen / camera_zoom) - camera_pos;
             camera_pos += mouse_world_after - mouse_world_before;
+            input_active = true;
         }
 
         if is_key_pressed(KeyCode::Space) {
             camera_pos = Vec2::ZERO;
             camera_zoom = 1.0;
+            input_active = true;
         }
 
         // 6. Draw Treemap Scene
@@ -875,7 +949,6 @@ async fn main() {
             Color::new(0.15, 0.17, 0.22, 1.0),
         );
 
-        let scanning = is_scanning.load(Ordering::Relaxed);
         let status_color = if scanning {
             Color::new(0.95, 0.8, 0.1, 1.0)
         } else {
@@ -924,6 +997,11 @@ async fn main() {
                 GRAY,
             );
             draw_text(&target_dir.to_string_lossy(), 420.0, 36.0, 14.0, LIGHTGRAY);
+        }
+
+        // 9. Resource Saving Idle State
+        if !is_animating && !layout_dirty && !scanning && !input_active {
+            thread::sleep(Duration::from_millis(50));
         }
 
         next_frame().await;
