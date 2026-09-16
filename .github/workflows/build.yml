@@ -1,0 +1,59 @@
+name: Build MVP
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: disk_treemap-linux
+            binary_pattern: 00_mvp/target/release/disk_treemap
+          - os: windows-latest
+            artifact_name: disk_treemap-windows
+            binary_pattern: 00_mvp/target/release/disk_treemap.exe
+
+    defaults:
+      run:
+        working-directory: 00_mvp
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # System dependencies required by macroquad/miniquad on headless Linux
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "00_mvp -> target"
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary_pattern }}
+          if-no-files-found: warn
