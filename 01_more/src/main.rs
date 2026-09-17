@@ -5,9 +5,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Instant;
 
@@ -812,35 +812,34 @@ async fn main() {
 
                     if !is_exists {
                         // Natural removal resolution (covers deletes & moved-out renames)
-                        if let Some(parent) = root_node.find_mut(parent_comps) {
-                            if let Some(pos) =
+                        if let Some(parent) = root_node.find_mut(parent_comps)
+                            && let Some(pos) =
                                 parent.children.iter().position(|c| c.name == item_name)
-                            {
-                                parent.children.remove(pos);
-                                parent.is_sorted = false;
-                                layout_dirty = true;
-                            }
+                        {
+                            parent.children.remove(pos);
+                            parent.is_sorted = false;
+                            layout_dirty = true;
                         }
                     } else if let Ok(meta) = fs::metadata(&path) {
                         if meta.is_dir() {
-                            if let Some(parent) = root_node.find_mut(parent_comps) {
-                                if !parent.children.iter().any(|c| c.name == item_name) {
-                                    let new_dir = FileNode::new(item_name.into_owned(), true, 0);
-                                    parent.children.push(new_dir);
-                                    parent.is_sorted = false;
-                                    layout_dirty = true;
+                            if let Some(parent) = root_node.find_mut(parent_comps)
+                                && !parent.children.iter().any(|c| c.name == item_name)
+                            {
+                                let new_dir = FileNode::new(item_name.into_owned(), true, 0);
+                                parent.children.push(new_dir);
+                                parent.is_sorted = false;
+                                layout_dirty = true;
 
-                                    // Spin off background deep recursion worker per new directory
-                                    active_scanners.fetch_add(1, Ordering::Release);
-                                    let tx = scan_tx_keep.clone();
-                                    let abort = abort_scan.clone();
-                                    let target = path.clone();
-                                    let scanners = active_scanners.clone();
-                                    thread::spawn(move || {
-                                        scan_directory_recursive(&target, &tx, &abort);
-                                        scanners.fetch_sub(1, Ordering::Release);
-                                    });
-                                }
+                                // Spin off background deep recursion worker per new directory
+                                active_scanners.fetch_add(1, Ordering::Release);
+                                let tx = scan_tx_keep.clone();
+                                let abort = abort_scan.clone();
+                                let target = path.clone();
+                                let scanners = active_scanners.clone();
+                                thread::spawn(move || {
+                                    scan_directory_recursive(&target, &tx, &abort);
+                                    scanners.fetch_sub(1, Ordering::Release);
+                                });
                             }
                         } else if meta.is_file() {
                             let new_size = meta.len();
