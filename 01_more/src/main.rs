@@ -1,19 +1,18 @@
 use macroquad::prelude::*;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use rayon::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // ============================================================================
-// 1. Data Structures (Memory Optimized: No PathBuf per leaf)
+// 1. Data Structures
 // ============================================================================
 
 pub struct FileNode {
@@ -21,16 +20,14 @@ pub struct FileNode {
     pub is_dir: bool,
     pub size_bytes: u64,
     pub children: Vec<FileNode>,
+    pub is_sorted: bool,
     pub color: Color,
 
-    // Layout targets & animated interpolation
     pub target_rect: Rect,
     pub current_rect: Rect,
 
-    // Real-time animation & write tracking
-    pub growth_pulse: f32, // 1.0 -> 0.0 visual decay
-    pub growth_rate: f64,  // Bytes / sec
-    pub last_size: u64,
+    pub growth_pulse: f32,
+    pub growth_rate: f64,
     pub last_change_time: Instant,
 }
 
@@ -47,17 +44,16 @@ impl FileNode {
             is_dir,
             size_bytes,
             children: Vec::new(),
+            is_sorted: false,
             color,
             target_rect: Rect::default(),
             current_rect: Rect::default(),
             growth_pulse: 0.0,
             growth_rate: 0.0,
-            last_size: size_bytes,
             last_change_time: Instant::now(),
         }
     }
 
-    /// Recursively find a child node matching relative path components
     pub fn find_mut(&mut self, components: &[&OsStr]) -> Option<&mut FileNode> {
         if components.is_empty() {
             return Some(self);
@@ -71,7 +67,6 @@ impl FileNode {
         None
     }
 
-    /// Update file size on inotify writes, compute write rate, bubble size delta upward
     pub fn update_file_size(
         &mut self,
         components: &[&OsStr],
@@ -81,16 +76,15 @@ impl FileNode {
         if components.is_empty() {
             let old_size = self.size_bytes;
             let diff = new_size as i64 - old_size as i64;
-            let dt = (now - self.last_change_time).as_secs_f64().max(0.01);
-
-            if diff > 0 {
-                self.growth_pulse = 1.0;
-                self.growth_rate = (diff as f64) / dt;
+            if diff != 0 {
+                let dt = (now - self.last_change_time).as_secs_f64().max(0.01);
+                if diff > 0 {
+                    self.growth_pulse = 1.0;
+                    self.growth_rate = (diff as f64) / dt;
+                }
+                self.size_bytes = new_size;
+                self.last_change_time = now;
             }
-
-            self.size_bytes = new_size;
-            self.last_size = old_size;
-            self.last_change_time = now;
             return Some(diff);
         }
 
@@ -98,9 +92,12 @@ impl FileNode {
         for child in &mut self.children {
             if child.name == target {
                 if let Some(diff) = child.update_file_size(&components[1..], new_size, now) {
-                    self.size_bytes = (self.size_bytes as i64 + diff).max(0) as u64;
-                    if diff > 0 {
-                        self.growth_pulse = (self.growth_pulse + 0.3).min(1.0);
+                    if diff != 0 {
+                        self.size_bytes = (self.size_bytes as i64 + diff).max(0) as u64;
+                        self.is_sorted = false;
+                        if diff > 0 {
+                            self.growth_pulse = (self.growth_pulse + 0.3).min(1.0);
+                        }
                     }
                     return Some(diff);
                 }
@@ -112,8 +109,13 @@ impl FileNode {
 }
 
 // ============================================================================
-// 2. Parallel Squarified Treemap Layout (Rayon + Zero-Allocation Hot Loop)
+// 2. Sequential Squarified Treemap Layout (Zero-Allocation Loop)
 // ============================================================================
+
+pub struct LayoutWorkspace {
+    areas: Vec<f64>,
+    row: Vec<usize>,
+}
 
 fn worst_aspect_ratio(
     row: &[usize],
@@ -210,13 +212,16 @@ fn layout_row(
     }
 }
 
-fn squarify_children(node: &mut FileNode) {
+fn squarify_children(node: &mut FileNode, ws: &mut LayoutWorkspace) {
     if node.children.is_empty() || node.size_bytes == 0 {
         return;
     }
 
-    node.children
-        .sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    if !node.is_sorted {
+        node.children
+            .sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        node.is_sorted = true;
+    }
 
     let total_bytes: u64 = node.children.iter().map(|c| c.size_bytes).sum();
     if total_bytes == 0 {
@@ -224,41 +229,44 @@ fn squarify_children(node: &mut FileNode) {
     }
 
     let total_area = (node.target_rect.w * node.target_rect.h) as f64;
-    let areas: Vec<f64> = node
-        .children
-        .iter()
-        .map(|c| (c.size_bytes as f64 / total_bytes as f64) * total_area)
-        .collect();
+
+    ws.areas.clear();
+    ws.areas.extend(
+        node.children
+            .iter()
+            .map(|c| (c.size_bytes as f64 / total_bytes as f64) * total_area),
+    );
 
     let mut remaining_rect = node.target_rect;
-    let mut row: Vec<usize> = Vec::new();
+    ws.row.clear();
     let mut row_sum = 0.0;
 
     for i in 0..node.children.len() {
-        if areas[i] <= 0.0 {
+        if ws.areas[i] <= 0.0 {
             node.children[i].target_rect = Rect::new(remaining_rect.x, remaining_rect.y, 0.0, 0.0);
             continue;
         }
 
         let side = remaining_rect.w.min(remaining_rect.h);
-        let worst_with = worst_aspect_ratio(&row, Some(i), &areas, row_sum + areas[i], side);
-        let worst_without = worst_aspect_ratio(&row, None, &areas, row_sum, side);
+        let worst_with =
+            worst_aspect_ratio(&ws.row, Some(i), &ws.areas, row_sum + ws.areas[i], side);
+        let worst_without = worst_aspect_ratio(&ws.row, None, &ws.areas, row_sum, side);
 
-        if row.is_empty() || worst_with <= worst_without {
-            row.push(i);
-            row_sum += areas[i];
+        if ws.row.is_empty() || worst_with <= worst_without {
+            ws.row.push(i);
+            row_sum += ws.areas[i];
         } else {
             layout_row(
                 &mut node.children,
-                &row,
-                &areas,
+                &ws.row,
+                &ws.areas,
                 row_sum,
                 &mut remaining_rect,
                 false,
             );
-            row.clear();
-            row.push(i);
-            row_sum = areas[i];
+            ws.row.clear();
+            ws.row.push(i);
+            row_sum = ws.areas[i];
 
             if remaining_rect.w <= 0.0 || remaining_rect.h <= 0.0 {
                 for j in (i + 1)..node.children.len() {
@@ -270,11 +278,11 @@ fn squarify_children(node: &mut FileNode) {
         }
     }
 
-    if !row.is_empty() {
+    if !ws.row.is_empty() {
         layout_row(
             &mut node.children,
-            &row,
-            &areas,
+            &ws.row,
+            &ws.areas,
             row_sum,
             &mut remaining_rect,
             true,
@@ -289,35 +297,47 @@ fn collapse_descendants(node: &mut FileNode, rect: Rect) {
     }
 }
 
-/// Recursive parallel layout using Rayon + 1px Visual Inset for folder hierarchy
-pub fn layout_treemap_parallel(node: &mut FileNode) {
+pub fn layout_treemap_sequential(node: &mut FileNode, ws: &mut LayoutWorkspace) {
     if node.children.is_empty() || node.size_bytes == 0 {
         return;
     }
 
-    squarify_children(node);
+    squarify_children(node, ws);
 
-    // Filter children into those that can be visually nested vs collapsed
-    let (eligible_subdirs, too_small): (Vec<&mut FileNode>, Vec<&mut FileNode>) = node
-        .children
-        .iter_mut()
-        .filter(|c| c.is_dir && !c.children.is_empty())
-        .partition(|c| c.target_rect.w >= 6.0 && c.target_rect.h >= 6.0 && c.size_bytes > 0);
-
-    for child in too_small {
-        let r = child.target_rect;
-        collapse_descendants(child, r);
+    for child in &mut node.children {
+        if child.is_dir && child.size_bytes > 0 {
+            if child.target_rect.w >= 6.0 && child.target_rect.h >= 6.0 {
+                child.target_rect = Rect::new(
+                    child.target_rect.x + 1.0,
+                    child.target_rect.y + 1.0,
+                    (child.target_rect.w - 2.0).max(1.0),
+                    (child.target_rect.h - 2.0).max(1.0),
+                );
+                layout_treemap_sequential(child, ws);
+            } else {
+                let r = child.target_rect;
+                collapse_descendants(child, r);
+            }
+        }
     }
+}
 
-    eligible_subdirs.into_par_iter().for_each(|child| {
-        child.target_rect = Rect::new(
-            child.target_rect.x + 1.0,
-            child.target_rect.y + 1.0,
-            (child.target_rect.w - 2.0).max(1.0),
-            (child.target_rect.h - 2.0).max(1.0),
-        );
-        layout_treemap_parallel(child);
-    });
+fn sum_tree_stats(node: &mut FileNode) -> (u64, u64) {
+    if !node.is_dir {
+        return (1, node.size_bytes);
+    }
+    let mut f = 0;
+    let mut b = 0;
+    for c in &mut node.children {
+        let (cf, cb) = sum_tree_stats(c);
+        f += cf;
+        b += cb;
+    }
+    if node.size_bytes != b {
+        node.size_bytes = b;
+        node.is_sorted = false;
+    }
+    (f, b)
 }
 
 // ============================================================================
@@ -331,17 +351,15 @@ pub struct DirectoryBatch {
 
 pub enum ScanEvent {
     Batch(DirectoryBatch),
-    Finished,
 }
 
 fn is_virtual_or_special_fs(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let s = path.to_string_lossy();
-        if s.starts_with("/proc")
-            || s.starts_with("/sys")
-            || s.starts_with("/dev")
-            || s.starts_with("/run")
+        if path.starts_with(Path::new("/proc"))
+            || path.starts_with(Path::new("/sys"))
+            || path.starts_with(Path::new("/dev"))
+            || path.starts_with(Path::new("/run"))
         {
             return true;
         }
@@ -349,20 +367,14 @@ fn is_virtual_or_special_fs(path: &Path) -> bool {
     false
 }
 
-fn scan_directory_recursive(
-    dir_path: &Path,
-    tx: &Sender<ScanEvent>,
-    abort: &Arc<AtomicBool>,
-    total_files: &Arc<AtomicU64>,
-    total_bytes: &Arc<AtomicU64>,
-) {
+fn scan_directory_recursive(dir_path: &Path, tx: &Sender<ScanEvent>, abort: &Arc<AtomicBool>) {
     if abort.load(Ordering::Relaxed) || is_virtual_or_special_fs(dir_path) {
         return;
     }
 
     let entries = match fs::read_dir(dir_path) {
         Ok(iter) => iter,
-        Err(_) => return, // Permission denied or inaccessible
+        Err(_) => return,
     };
 
     let mut scanned_children = Vec::new();
@@ -378,7 +390,6 @@ fn scan_directory_recursive(
             Err(_) => continue,
         };
 
-        // Skip symlinks to prevent circular loops
         if file_type.is_symlink() {
             continue;
         }
@@ -392,12 +403,8 @@ fn scan_directory_recursive(
         } else if file_type.is_file() {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if size > (1 << 48) {
-                continue; // Ignore virtual pseudo-files (e.g., /proc/kcore)
+                continue;
             }
-
-            total_files.fetch_add(1, Ordering::Relaxed);
-            total_bytes.fetch_add(size, Ordering::Relaxed);
-
             scanned_children.push(FileNode::new(name, false, size));
         }
     }
@@ -408,17 +415,37 @@ fn scan_directory_recursive(
     }));
 
     for subdir in subdirs_to_recurse {
-        scan_directory_recursive(&subdir, tx, abort, total_files, total_bytes);
+        scan_directory_recursive(&subdir, tx, abort);
+    }
+}
+
+fn merge_scanned_node(parent: &mut FileNode, mut new_child: FileNode) {
+    if let Some(existing) = parent
+        .children
+        .iter_mut()
+        .find(|c| c.name == new_child.name && c.is_dir == new_child.is_dir)
+    {
+        if existing.is_dir {
+            for child in new_child.children.drain(..) {
+                merge_scanned_node(existing, child);
+            }
+        } else if existing.size_bytes != new_child.size_bytes {
+            existing.size_bytes = new_child.size_bytes;
+        }
+    } else {
+        new_child.target_rect = parent.target_rect;
+        new_child.current_rect = parent.current_rect;
+        parent.children.push(new_child);
+        parent.is_sorted = false;
     }
 }
 
 // ============================================================================
-// 4. Live Filesystem Watcher (inotify / notify bridge)
+// 4. Live Filesystem Watcher
 // ============================================================================
 
 pub struct FileChangeEvent {
-    pub path: PathBuf,
-    pub is_removal: bool,
+    pub paths: Vec<PathBuf>,
 }
 
 fn start_fs_watcher(
@@ -427,27 +454,23 @@ fn start_fs_watcher(
 ) -> Option<notify::RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
-            // Ignore access events, forward everything else robustly
             if matches!(event.kind, EventKind::Access(_)) {
                 return;
             }
-            for path in event.paths {
-                let is_removal = matches!(event.kind, EventKind::Remove(_));
-                let _ = tx.send(FileChangeEvent { path, is_removal });
-            }
+            let _ = tx.send(FileChangeEvent { paths: event.paths });
         }
     })
     .ok()?;
 
-    let _ = watcher.watch(&root_path, RecursiveMode::Recursive).ok()?;
+    watcher.watch(&root_path, RecursiveMode::Recursive).ok()?;
     Some(watcher)
 }
 
 // ============================================================================
-// 5. Rendering, Spring Animation & Non-Overwriting Hover Detection
+// 5. Rendering & Non-Allocating String Hover
 // ============================================================================
 
-fn update_animations(node: &mut FileNode, dt: f32) -> bool {
+fn update_animations(node: &mut FileNode, dt: f32, now: Instant) -> bool {
     let mut still_anim = false;
 
     if (node.target_rect.x - node.current_rect.x).abs() > 0.1
@@ -462,7 +485,7 @@ fn update_animations(node: &mut FileNode, dt: f32) -> bool {
         node.current_rect.h += (node.target_rect.h - node.current_rect.h) * t;
         still_anim = true;
     } else {
-        node.current_rect = node.target_rect; // Snap exactly
+        node.current_rect = node.target_rect;
     }
 
     if node.growth_pulse > 0.0 {
@@ -470,8 +493,13 @@ fn update_animations(node: &mut FileNode, dt: f32) -> bool {
         still_anim |= node.growth_pulse > 0.001;
     }
 
+    if node.growth_rate > 0.0 && (now - node.last_change_time).as_secs_f32() > 2.0 {
+        node.growth_rate = 0.0;
+        still_anim = true;
+    }
+
     for child in &mut node.children {
-        still_anim |= update_animations(child, dt);
+        still_anim |= update_animations(child, dt, now);
     }
     still_anim
 }
@@ -485,7 +513,7 @@ fn snap_tree(node: &mut FileNode) {
 
 fn draw_cushion_rect(rect: Rect, base_color: Color, pulse: f32) {
     let fill_color = if pulse > 0.0 {
-        let pulse_color = Color::new(0.3, 1.0, 0.4, 1.0); // Neon pulse highlight
+        let pulse_color = Color::new(0.3, 1.0, 0.4, 1.0);
         Color::new(
             base_color.r * (1.0 - pulse) + pulse_color.r * pulse,
             base_color.g * (1.0 - pulse) + pulse_color.g * pulse,
@@ -550,7 +578,6 @@ fn draw_cushion_rect(rect: Rect, base_color: Color, pulse: f32) {
     }
 }
 
-/// Render with LOD culling to avoid draw-call explosion on huge directory trees
 fn render_treemap(
     node: &FileNode,
     view_min: Vec2,
@@ -559,7 +586,6 @@ fn render_treemap(
     camera_zoom: f32,
 ) {
     let r = node.current_rect;
-    // Frustum Culling
     if r.x > view_max.x || (r.x + r.w) < view_min.x || r.y > view_max.y || (r.y + r.h) < view_min.y
     {
         return;
@@ -570,17 +596,14 @@ fn render_treemap(
     let screen_w = r.w * camera_zoom;
     let screen_h = r.h * camera_zoom;
 
-    // Subpixel Culling
     if screen_w < 1.0 || screen_h < 1.0 {
         return;
     }
-
     let screen_rect = Rect::new(screen_x, screen_y, screen_w, screen_h);
 
     if node.children.is_empty() {
         draw_cushion_rect(screen_rect, node.color, node.growth_pulse);
     } else {
-        // LOD Threshold: If folder rectangle is < 4x4 screen pixels, draw a flat placeholder and skip traversing children
         if screen_w < 4.0 || screen_h < 4.0 {
             draw_rectangle(
                 screen_x,
@@ -591,7 +614,6 @@ fn render_treemap(
             );
             return;
         }
-
         for child in &node.children {
             render_treemap(child, view_min, view_max, camera_pos, camera_zoom);
         }
@@ -605,7 +627,6 @@ fn render_treemap(
         );
     }
 
-    // Dynamic Label Rendering
     if screen_w > 65.0 && screen_h > 20.0 {
         let label = if node.growth_rate > 1024.0 {
             format!(
@@ -621,34 +642,29 @@ fn render_treemap(
     }
 }
 
-/// Dedicated hover detection: Searches children first so leaves always take precedence over parents
-fn find_hovered<'a>(
+fn find_hovered_path<'a>(
     node: &'a FileNode,
     pt: Vec2,
-    path_acc: String,
-) -> Option<(&'a FileNode, String)> {
+    path_out: &mut String,
+) -> Option<&'a FileNode> {
     if !node.current_rect.contains(pt) {
         return None;
     }
+    if !path_out.is_empty() {
+        path_out.push('/');
+    }
+    path_out.push_str(&node.name);
 
-    let current_path = if path_acc.is_empty() {
-        node.name.clone()
-    } else {
-        format!("{}/{}", path_acc, node.name)
-    };
-
-    // Deepest child match wins
     for child in &node.children {
-        if let Some(hit) = find_hovered(child, pt, current_path.clone()) {
-            return Some(hit);
+        if child.current_rect.contains(pt) {
+            return find_hovered_path(child, pt, path_out);
         }
     }
-
-    Some((node, current_path))
+    Some(node)
 }
 
 // ============================================================================
-// 6. Color Generator & Formatting
+// 6. Formatting & Color Generator
 // ============================================================================
 
 fn get_color_for_filename(name: &str) -> Color {
@@ -657,7 +673,6 @@ fn get_color_for_filename(name: &str) -> Color {
         .and_then(OsStr::to_str)
         .unwrap_or("")
         .to_lowercase();
-
     match ext.as_str() {
         "mp4" | "mkv" | "avi" | "mov" => Color::new(0.72, 0.23, 0.86, 1.0),
         "mp3" | "flac" | "wav" | "ogg" => Color::new(0.94, 0.80, 0.14, 1.0),
@@ -692,10 +707,6 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.2} {}", d, SUFFIXES[i])
 }
 
-// ============================================================================
-// 7. Main Event Loop
-// ============================================================================
-
 fn window_conf() -> Conf {
     Conf {
         window_title: "Treemap Disk Visualizer".to_string(),
@@ -703,12 +714,16 @@ fn window_conf() -> Conf {
         window_height: 720,
         high_dpi: true,
         platform: macroquad::miniquad::conf::Platform {
-            swap_interval: Some(1), // Lock to vsync
+            swap_interval: Some(1),
             ..Default::default()
         },
         ..Default::default()
     }
 }
+
+// ============================================================================
+// 7. Main Event Loop
+// ============================================================================
 
 #[macroquad::main(window_conf)]
 async fn main() {
@@ -716,8 +731,6 @@ async fn main() {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-
-    // Canonicalize to guarantee valid absolute paths on all platforms
     let target_dir = fs::canonicalize(&raw_target).unwrap_or(raw_target);
     let root_name = target_dir
         .file_name()
@@ -726,137 +739,126 @@ async fn main() {
 
     let mut root_node = FileNode::new(root_name, true, 0);
 
-    // Thread Communication & Atomies
-    let total_files = Arc::new(AtomicU64::new(0));
-    let total_bytes = Arc::new(AtomicU64::new(0));
-    let is_scanning = Arc::new(AtomicBool::new(true));
+    let active_scanners = Arc::new(AtomicUsize::new(1));
     let abort_scan = Arc::new(AtomicBool::new(false));
 
-    let (scan_tx, scan_rx): (Sender<ScanEvent>, Receiver<ScanEvent>) = channel();
-    let (watch_tx, watch_rx): (Sender<FileChangeEvent>, Receiver<FileChangeEvent>) = channel();
+    let (scan_tx, scan_rx) = channel();
+    let scan_tx_keep = scan_tx.clone();
+    let (watch_tx, watch_rx) = channel();
 
     // Start background scanner thread
     {
         let target_dir = target_dir.clone();
         let abort = abort_scan.clone();
-        let files = total_files.clone();
-        let bytes = total_bytes.clone();
-        let is_scanning = is_scanning.clone();
-
+        let tx = scan_tx_keep.clone();
+        let scanners = active_scanners.clone();
         thread::spawn(move || {
-            scan_directory_recursive(&target_dir, &scan_tx, &abort, &files, &bytes);
-            let _ = scan_tx.send(ScanEvent::Finished);
-            is_scanning.store(false, Ordering::Release);
+            scan_directory_recursive(&target_dir, &tx, &abort);
+            scanners.fetch_sub(1, Ordering::Release);
         });
     }
 
-    // Start inotify file watcher
     let _watcher = start_fs_watcher(target_dir.clone(), watch_tx);
+    let watcher_active = _watcher.is_some();
 
     let mut camera_pos = Vec2::ZERO;
     let mut camera_zoom = 1.0f32;
     let mut last_mouse = Vec2::ZERO;
-    
+
     let mut layout_dirty = true;
     let mut is_animating = true;
     let mut last_layout_time = Instant::now();
+    let mut hovered_path_cache = String::with_capacity(256);
+
+    let mut tree_files: u64 = 0;
+    let mut tree_bytes: u64 = 0;
+    let mut layout_workspace = LayoutWorkspace {
+        areas: Vec::new(),
+        row: Vec::new(),
+    };
 
     loop {
         let dt = get_frame_time().min(0.05);
         let screen_w = screen_width();
         let screen_h = screen_height();
-        // Safe canvas computation (prevents negative dimensions when window is minimized)
         let world_canvas = Rect::new(0.0, 44.0, screen_w, (screen_h - 44.0).max(1.0));
-        let mut input_active = false;
-
-        // 1. Drain progressive scan batches from worker thread
-        while let Ok(event) = scan_rx.try_recv() {
-            match event {
-                ScanEvent::Batch(batch) => {
-                    if let Ok(rel) = batch.parent_path.strip_prefix(&target_dir) {
-                        let components: Vec<&OsStr> = rel.iter().collect();
-                        if let Some(parent) = root_node.find_mut(&components) {
-                            for mut child in batch.children {
-                                child.target_rect = parent.target_rect;
-                                child.current_rect = parent.current_rect;
-                                parent.children.push(child);
-                            }
-                            layout_dirty = true;
-                        }
-                    }
-                }
-                ScanEvent::Finished => {
-                    layout_dirty = true;
-                }
-            }
-        }
-
-        // 2. Drain live inotify file changes, rely on OS fs state rather than event enum alone
         let now = Instant::now();
-        while let Ok(change) = watch_rx.try_recv() {
-            if let Ok(rel) = change.path.strip_prefix(&target_dir) {
-                let components: Vec<&OsStr> = rel.iter().collect();
-                if components.is_empty() { continue; } // Exclude root alterations from this logic
 
-                let parent_comps = &components[..components.len() - 1];
-                let item_name = components.last().unwrap().to_string_lossy();
-                let is_exists = change.path.exists();
-                let is_removal = change.is_removal || !is_exists;
-
-                if is_removal {
-                    if let Some(parent) = root_node.find_mut(parent_comps) {
-                        if let Some(pos) = parent.children.iter().position(|c| c.name == item_name) {
-                            let removed = parent.children.remove(pos);
-                            total_files.fetch_sub(1, Ordering::Relaxed);
-                            total_bytes.fetch_sub(removed.size_bytes, Ordering::Relaxed);
-                            layout_dirty = true;
+        // 1. Drain progressive scan batches from worker thread(s)
+        while let Ok(event) = scan_rx.try_recv() {
+            if let ScanEvent::Batch(mut batch) = event {
+                if let Ok(rel) = batch.parent_path.strip_prefix(&target_dir) {
+                    let components: Vec<&OsStr> = rel.iter().collect();
+                    if let Some(parent) = root_node.find_mut(&components) {
+                        for child in batch.children.drain(..) {
+                            merge_scanned_node(parent, child);
                         }
+                        layout_dirty = true;
                     }
-                } else if let Ok(meta) = fs::metadata(&change.path) {
-                    if meta.is_dir() {
+                }
+            }
+        }
+
+        // 2. Drain live file watcher events - Rely completely on platform-backed path reality rather than enum modes
+        while let Ok(change) = watch_rx.try_recv() {
+            for path in change.paths {
+                if let Ok(rel) = path.strip_prefix(&target_dir) {
+                    let components: Vec<&OsStr> = rel.iter().collect();
+                    if components.is_empty() {
+                        continue;
+                    }
+
+                    let parent_comps = &components[..components.len() - 1];
+                    let item_name = components.last().unwrap().to_string_lossy();
+                    let is_exists = path.exists();
+
+                    if !is_exists {
+                        // Natural removal resolution (covers deletes & moved-out renames)
                         if let Some(parent) = root_node.find_mut(parent_comps) {
-                            if !parent.children.iter().any(|c| c.name == item_name) {
-                                // Do a real immediate local scan of this new dir
-                                let mut new_dir = FileNode::new(item_name.into_owned(), true, 0);
-                                if let Ok(entries) = fs::read_dir(&change.path) {
-                                    for e in entries.flatten() {
-                                        if let Ok(ft) = e.file_type() {
-                                            if ft.is_symlink() { continue; } // prevent loops
-                                            let name = e.file_name().to_string_lossy().into_owned();
-                                            if ft.is_dir() {
-                                                new_dir.children.push(FileNode::new(name, true, 0));
-                                            } else if ft.is_file() {
-                                                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                                                if size <= (1 << 48) {
-                                                    total_files.fetch_add(1, Ordering::Relaxed);
-                                                    total_bytes.fetch_add(size, Ordering::Relaxed);
-                                                    new_dir.children.push(FileNode::new(name, false, size));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                parent.children.push(new_dir);
+                            if let Some(pos) =
+                                parent.children.iter().position(|c| c.name == item_name)
+                            {
+                                parent.children.remove(pos);
+                                parent.is_sorted = false;
                                 layout_dirty = true;
                             }
                         }
-                    } else if meta.is_file() {
-                        let new_size = meta.len();
-                        if let Some(diff) = root_node.update_file_size(&components, new_size, now) {
-                            if diff != 0 {
-                                if diff > 0 {
-                                    total_bytes.fetch_add(diff as u64, Ordering::Relaxed);
-                                } else {
-                                    total_bytes.fetch_sub((-diff) as u64, Ordering::Relaxed);
-                                }
-                                layout_dirty = true;
-                            }
-                        } else {
-                            // Target wasn't found - insert the new file
+                    } else if let Ok(meta) = fs::metadata(&path) {
+                        if meta.is_dir() {
                             if let Some(parent) = root_node.find_mut(parent_comps) {
-                                total_files.fetch_add(1, Ordering::Relaxed);
-                                total_bytes.fetch_add(new_size, Ordering::Relaxed);
-                                parent.children.push(FileNode::new(item_name.into_owned(), false, new_size));
+                                if !parent.children.iter().any(|c| c.name == item_name) {
+                                    let new_dir = FileNode::new(item_name.into_owned(), true, 0);
+                                    parent.children.push(new_dir);
+                                    parent.is_sorted = false;
+                                    layout_dirty = true;
+
+                                    // Spin off background deep recursion worker per new directory
+                                    active_scanners.fetch_add(1, Ordering::Release);
+                                    let tx = scan_tx_keep.clone();
+                                    let abort = abort_scan.clone();
+                                    let target = path.clone();
+                                    let scanners = active_scanners.clone();
+                                    thread::spawn(move || {
+                                        scan_directory_recursive(&target, &tx, &abort);
+                                        scanners.fetch_sub(1, Ordering::Release);
+                                    });
+                                }
+                            }
+                        } else if meta.is_file() {
+                            let new_size = meta.len();
+                            if let Some(diff) =
+                                root_node.update_file_size(&components, new_size, now)
+                            {
+                                if diff != 0 {
+                                    layout_dirty = true;
+                                }
+                            } else if let Some(parent) = root_node.find_mut(parent_comps) {
+                                parent.children.push(FileNode::new(
+                                    item_name.into_owned(),
+                                    false,
+                                    new_size,
+                                ));
+                                parent.is_sorted = false;
                                 layout_dirty = true;
                             }
                         }
@@ -865,44 +867,33 @@ async fn main() {
             }
         }
 
-        // 3. Parallel Treemap Recalculation (Rayon) debounced by 100ms when scanning 
-        let scanning = is_scanning.load(Ordering::Relaxed);
+        // 3. Debounced Squarified Treemap Execution (Sequential + Zero Allocation logic)
+        let scanning = active_scanners.load(Ordering::Acquire) > 0;
         if layout_dirty && (!scanning || last_layout_time.elapsed().as_millis() > 100) {
             root_node.target_rect = world_canvas;
 
-            fn sum_tree_bytes(node: &mut FileNode) -> u64 {
-                if !node.is_dir {
-                    return node.size_bytes;
-                }
-                let s: u64 = node.children.iter_mut().map(sum_tree_bytes).sum();
-                node.size_bytes = s;
-                s
-            }
-            root_node.size_bytes = sum_tree_bytes(&mut root_node);
+            // Re-aggregate authoritative file sizes
+            let (f_count, b_count) = sum_tree_stats(&mut root_node);
+            tree_files = f_count;
+            tree_bytes = b_count;
 
-            layout_treemap_parallel(&mut root_node);
+            layout_treemap_sequential(&mut root_node, &mut layout_workspace);
             layout_dirty = false;
             is_animating = true;
             last_layout_time = Instant::now();
         }
 
-        // 4. Update spring lerps & animations tracking
         if scanning {
             snap_tree(&mut root_node);
         } else if is_animating {
-            is_animating = update_animations(&mut root_node, dt);
+            is_animating = update_animations(&mut root_node, dt, now);
         }
 
-        // 5. Input Handling: Pan, Zoom, Reset
+        // 4. Input Handling: Pan, Zoom, Reset
         let mouse_screen = Vec2::from(mouse_position());
-        if mouse_screen != last_mouse {
-            input_active = true;
-        }
-
         if is_mouse_button_down(MouseButton::Left) || is_mouse_button_down(MouseButton::Middle) {
             let delta = (mouse_screen - last_mouse) / camera_zoom;
             camera_pos += delta;
-            input_active = true;
         }
         last_mouse = mouse_screen;
 
@@ -917,28 +908,25 @@ async fn main() {
             camera_zoom = camera_zoom.clamp(0.05, 100.0);
             let mouse_world_after = (mouse_screen / camera_zoom) - camera_pos;
             camera_pos += mouse_world_after - mouse_world_before;
-            input_active = true;
         }
 
         if is_key_pressed(KeyCode::Space) {
             camera_pos = Vec2::ZERO;
             camera_zoom = 1.0;
-            input_active = true;
         }
 
-        // 6. Draw Treemap Scene
+        // 5. Draw Treemap Scene
         clear_background(Color::new(0.08, 0.09, 0.12, 1.0));
-
         let view_min = -camera_pos;
         let view_max = (Vec2::new(screen_w, screen_h) / camera_zoom) - camera_pos;
-
         render_treemap(&root_node, view_min, view_max, camera_pos, camera_zoom);
 
-        // 7. Non-Overwriting Hover Detection
+        // 6. Non-Overwriting (Zero Allocation) Hover Hit-Detection
+        hovered_path_cache.clear();
         let mouse_world = (mouse_screen / camera_zoom) - camera_pos;
-        let hovered_info = find_hovered(&root_node, mouse_world, String::new());
+        let hovered_node = find_hovered_path(&root_node, mouse_world, &mut hovered_path_cache);
 
-        // 8. Draw Status Bar & HUD
+        // 7. Draw HUD
         draw_rectangle(0.0, 0.0, screen_w, 44.0, Color::new(0.06, 0.07, 0.09, 0.95));
         draw_line(
             0.0,
@@ -951,40 +939,51 @@ async fn main() {
 
         let status_color = if scanning {
             Color::new(0.95, 0.8, 0.1, 1.0)
-        } else {
+        } else if watcher_active {
             Color::new(0.2, 0.85, 0.3, 1.0)
+        } else {
+            Color::new(0.9, 0.2, 0.2, 1.0)
         };
+
         let status_text = if scanning {
             "SCANNING..."
+        } else if watcher_active {
+            #[cfg(target_os = "linux")]
+            {
+                "WATCHING (INOTIFY)"
+            }
+            #[cfg(target_os = "windows")]
+            {
+                "WATCHING (ReadDirectoryChangesW)"
+            }
+            #[cfg(target_os = "macos")]
+            {
+                "WATCHING (FSEvents)"
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            {
+                "WATCHING (FS API)"
+            }
         } else {
-            "WATCHING (INOTIFY)"
+            "WATCHER FAILED"
         };
 
         draw_text(status_text, 14.0, 18.0, 16.0, status_color);
+        draw_text(&format!("Files: {}", tree_files), 220.0, 18.0, 16.0, WHITE);
         draw_text(
-            &format!("Files: {}", total_files.load(Ordering::Relaxed)),
-            220.0,
-            18.0,
-            16.0,
-            WHITE,
-        );
-        draw_text(
-            &format!(
-                "Size: {}",
-                format_bytes(total_bytes.load(Ordering::Relaxed))
-            ),
+            &format!("Size: {}", format_bytes(tree_bytes)),
             360.0,
             18.0,
             16.0,
             Color::new(0.2, 0.8, 1.0, 1.0),
         );
 
-        if let Some((hovered_node, path_str)) = hovered_info {
-            let mut info = format!("{} ({})", path_str, format_bytes(hovered_node.size_bytes));
-            if hovered_node.growth_rate > 1024.0 {
+        if let Some(node) = hovered_node {
+            let mut info = format!("{} ({})", hovered_path_cache, format_bytes(node.size_bytes));
+            if node.growth_rate > 1024.0 {
                 info.push_str(&format!(
                     "  [Active: {}/s]",
-                    format_bytes(hovered_node.growth_rate as u64)
+                    format_bytes(node.growth_rate as u64)
                 ));
             }
             draw_text(&info, 14.0, 36.0, 14.0, Color::new(0.9, 0.9, 0.9, 1.0));
@@ -997,11 +996,6 @@ async fn main() {
                 GRAY,
             );
             draw_text(&target_dir.to_string_lossy(), 420.0, 36.0, 14.0, LIGHTGRAY);
-        }
-
-        // 9. Resource Saving Idle State
-        if !is_animating && !layout_dirty && !scanning && !input_active {
-            thread::sleep(Duration::from_millis(50));
         }
 
         next_frame().await;
