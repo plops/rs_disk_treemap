@@ -1,13 +1,13 @@
 use macroquad::prelude::*;
-use notify::{Event, EventKind, RecursiveMode, Watcher};
-use std::collections::hash_map::DefaultHasher;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Instant;
 
@@ -353,13 +353,13 @@ pub enum ScanEvent {
     Batch(DirectoryBatch),
 }
 
-fn is_virtual_or_special_fs(_path: &Path) -> bool {
+fn is_virtual_or_special_fs(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
-        if _path.starts_with(Path::new("/proc"))
-            || _path.starts_with(Path::new("/sys"))
-            || _path.starts_with(Path::new("/dev"))
-            || _path.starts_with(Path::new("/run"))
+        if path.starts_with("/proc")
+            || path.starts_with("/sys")
+            || path.starts_with("/dev")
+            || path.starts_with("/run")
         {
             return true;
         }
@@ -398,8 +398,10 @@ fn scan_directory_recursive(dir_path: &Path, tx: &Sender<ScanEvent>, abort: &Arc
         let name = entry.file_name().to_string_lossy().into_owned();
 
         if file_type.is_dir() {
-            scanned_children.push(FileNode::new(name, true, 0));
-            subdirs_to_recurse.push(path);
+            if !is_virtual_or_special_fs(&path) {
+                scanned_children.push(FileNode::new(name, true, 0));
+                subdirs_to_recurse.push(path);
+            }
         } else if file_type.is_file() {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if size > (1 << 48) {
@@ -441,29 +443,118 @@ fn merge_scanned_node(parent: &mut FileNode, mut new_child: FileNode) {
 }
 
 // ============================================================================
-// 4. Live Filesystem Watcher
+// 4. Platform-Adaptive Live Watcher Manager
 // ============================================================================
 
-pub struct FileChangeEvent {
-    pub paths: Vec<PathBuf>,
+pub struct WatcherManager {
+    pub watcher: Option<RecommendedWatcher>,
+    pub rx: Receiver<notify::Result<Event>>,
+    pub watched_dirs: HashSet<PathBuf>,
+    pub is_native_recursive: bool,
+    pub limit_hit: bool,
+    pub error_msg: Option<String>,
 }
 
-fn start_fs_watcher(
-    root_path: PathBuf,
-    tx: Sender<FileChangeEvent>,
-) -> Option<notify::RecommendedWatcher> {
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        if let Ok(event) = res {
-            if matches!(event.kind, EventKind::Access(_)) {
-                return;
-            }
-            let _ = tx.send(FileChangeEvent { paths: event.paths });
-        }
-    })
-    .ok()?;
+impl WatcherManager {
+    pub fn new(root_path: &Path) -> Self {
+        let (tx, rx) = channel();
 
-    watcher.watch(&root_path, RecursiveMode::Recursive).ok()?;
-    Some(watcher)
+        // macOS (FSEvents) and Windows (ReadDirectoryChangesW) handle recursion
+        // efficiently in kernel space with zero watch-descriptor overhead.
+        // Linux (Inotify) and BSD (Kqueue) require individual directory handles.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let is_native_recursive = true;
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let is_native_recursive = false;
+
+        let mut watcher_opt = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                eprintln!("[Watcher] Initialization failed: {e}");
+                return Self {
+                    watcher: None,
+                    rx,
+                    watched_dirs: HashSet::new(),
+                    is_native_recursive,
+                    limit_hit: false,
+                    error_msg: Some(format!("Init error: {e}")),
+                };
+            }
+        };
+
+        let mut watched_dirs = HashSet::new();
+        let mut error_msg = None;
+        let mut limit_hit = false;
+
+        if let Some(ref mut watcher) = watcher_opt {
+            let mode = if is_native_recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+
+            match watcher.watch(root_path, mode) {
+                Ok(_) => {
+                    watched_dirs.insert(root_path.to_path_buf());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Watcher] Failed to watch root '{}': {e}",
+                        root_path.display()
+                    );
+                    let err_str = e.to_string();
+                    if err_str.contains("os error 28") || err_str.contains("No space left") {
+                        limit_hit = true;
+                    }
+                    error_msg = Some(err_str);
+                }
+            }
+        }
+
+        Self {
+            watcher: watcher_opt,
+            rx,
+            watched_dirs,
+            is_native_recursive,
+            limit_hit,
+            error_msg,
+        }
+    }
+
+    /// Register a newly scanned directory with the watcher pool
+    pub fn register_dir(&mut self, path: &Path) {
+        if self.is_native_recursive || self.limit_hit || is_virtual_or_special_fs(path) {
+            return;
+        }
+
+        if self.watched_dirs.contains(path) {
+            return;
+        }
+
+        if let Some(ref mut watcher) = self.watcher {
+            match watcher.watch(path, RecursiveMode::NonRecursive) {
+                Ok(_) => {
+                    self.watched_dirs.insert(path.to_path_buf());
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("os error 28") || err_str.contains("No space left") {
+                        if !self.limit_hit {
+                            eprintln!(
+                                "\n[Watcher Warning] Linux inotify user watch limit reached!"
+                            );
+                            eprintln!("Run: sudo sysctl fs.inotify.max_user_watches=524288\n");
+                            self.limit_hit = true;
+                        }
+                    } else {
+                        self.error_msg = Some(err_str);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -627,7 +718,7 @@ fn render_treemap(
         );
     }
 
-    if screen_w > 65.0 && screen_h > 20.0 {
+    if screen_w > 55.0 && screen_h > 18.0 {
         let label = if node.growth_rate > 1024.0 {
             format!(
                 "{} [+{}/s]",
@@ -637,8 +728,17 @@ fn render_treemap(
         } else {
             node.name.clone()
         };
-        draw_text(&label, screen_x + 5.0, screen_y + 14.0, 14.0, BLACK);
-        draw_text(&label, screen_x + 4.0, screen_y + 13.0, 14.0, WHITE);
+
+        // Text truncation to avoid overlapping neighboring cells
+        let max_chars = ((screen_w - 10.0) / 7.2) as usize;
+        let display_label = if label.len() > max_chars && max_chars > 3 {
+            format!("{}..", &label[..max_chars - 2])
+        } else {
+            label
+        };
+
+        draw_text(&display_label, screen_x + 5.0, screen_y + 14.0, 14.0, BLACK);
+        draw_text(&display_label, screen_x + 4.0, screen_y + 13.0, 14.0, WHITE);
     }
 }
 
@@ -744,9 +844,8 @@ async fn main() {
 
     let (scan_tx, scan_rx) = channel();
     let scan_tx_keep = scan_tx.clone();
-    let (watch_tx, watch_rx) = channel();
 
-    // Start background scanner thread
+    // Spawn primary scanner thread
     {
         let target_dir = target_dir.clone();
         let abort = abort_scan.clone();
@@ -758,8 +857,8 @@ async fn main() {
         });
     }
 
-    let _watcher = start_fs_watcher(target_dir.clone(), watch_tx);
-    let watcher_active = _watcher.is_some();
+    // Initialize watcher manager
+    let mut watcher_mgr = WatcherManager::new(&target_dir);
 
     let mut camera_pos = Vec2::ZERO;
     let mut camera_zoom = 1.0f32;
@@ -786,6 +885,9 @@ async fn main() {
 
         // 1. Drain progressive scan batches from worker thread(s)
         while let Ok(ScanEvent::Batch(mut batch)) = scan_rx.try_recv() {
+            // Add directory to watcher pool on non-recursive backends (Linux inotify)
+            watcher_mgr.register_dir(&batch.parent_path);
+
             if let Ok(rel) = batch.parent_path.strip_prefix(&target_dir) {
                 let components: Vec<&OsStr> = rel.iter().collect();
                 if let Some(parent) = root_node.find_mut(&components) {
@@ -797,79 +899,104 @@ async fn main() {
             }
         }
 
-        // 2. Drain live file watcher events
-        while let Ok(change) = watch_rx.try_recv() {
-            for path in change.paths {
-                if let Ok(rel) = path.strip_prefix(&target_dir) {
-                    let components: Vec<&OsStr> = rel.iter().collect();
-                    if components.is_empty() {
+        // 2. Drain live filesystem events
+        while let Ok(res) = watcher_mgr.rx.try_recv() {
+            match res {
+                Ok(event) => {
+                    if matches!(event.kind, EventKind::Access(_)) {
                         continue;
                     }
 
-                    let parent_comps = &components[..components.len() - 1];
-                    let item_name = components.last().unwrap().to_string_lossy();
-                    let is_exists = path.exists();
-
-                    if !is_exists {
-                        // Natural removal resolution (covers deletes & moved-out renames)
-                        if let Some(parent) = root_node.find_mut(parent_comps)
-                            && let Some(pos) =
-                                parent.children.iter().position(|c| c.name == item_name)
-                        {
-                            parent.children.remove(pos);
-                            parent.is_sorted = false;
-                            layout_dirty = true;
+                    for path in event.paths {
+                        if is_virtual_or_special_fs(&path) {
+                            continue;
                         }
-                    } else if let Ok(meta) = fs::metadata(&path) {
-                        if meta.is_dir() {
-                            if let Some(parent) = root_node.find_mut(parent_comps)
-                                && !parent.children.iter().any(|c| c.name == item_name)
-                            {
-                                let new_dir = FileNode::new(item_name.into_owned(), true, 0);
-                                parent.children.push(new_dir);
-                                parent.is_sorted = false;
-                                layout_dirty = true;
 
-                                // Spin off background deep recursion worker per new directory
-                                active_scanners.fetch_add(1, Ordering::Release);
-                                let tx = scan_tx_keep.clone();
-                                let abort = abort_scan.clone();
-                                let target = path.clone();
-                                let scanners = active_scanners.clone();
-                                thread::spawn(move || {
-                                    scan_directory_recursive(&target, &tx, &abort);
-                                    scanners.fetch_sub(1, Ordering::Release);
-                                });
+                        if let Ok(rel) = path.strip_prefix(&target_dir) {
+                            let components: Vec<&OsStr> = rel.iter().collect();
+                            if components.is_empty() {
+                                continue;
                             }
-                        } else if meta.is_file() {
-                            let new_size = meta.len();
-                            if let Some(diff) =
-                                root_node.update_file_size(&components, new_size, now)
-                            {
-                                if diff != 0 {
+
+                            let parent_comps = &components[..components.len() - 1];
+                            let item_name = components.last().unwrap().to_string_lossy();
+                            let is_exists = path.exists();
+
+                            if !is_exists {
+                                // Natural removal resolution (covers deletes & moved-out renames)
+                                if let Some(parent) = root_node.find_mut(parent_comps)
+                                    && let Some(pos) =
+                                        parent.children.iter().position(|c| c.name == item_name)
+                                {
+                                    parent.children.remove(pos);
+                                    parent.is_sorted = false;
                                     layout_dirty = true;
                                 }
-                            } else if let Some(parent) = root_node.find_mut(parent_comps) {
-                                parent.children.push(FileNode::new(
-                                    item_name.into_owned(),
-                                    false,
-                                    new_size,
-                                ));
-                                parent.is_sorted = false;
-                                layout_dirty = true;
+                            } else if let Ok(meta) = fs::metadata(&path) {
+                                if meta.is_dir() {
+                                    let dir_needs_scan =
+                                        if let Some(parent) = root_node.find_mut(parent_comps) {
+                                            !parent.children.iter().any(|c| c.name == item_name)
+                                        } else {
+                                            false
+                                        };
+
+                                    if dir_needs_scan {
+                                        if let Some(parent) = root_node.find_mut(parent_comps) {
+                                            let new_dir =
+                                                FileNode::new(item_name.into_owned(), true, 0);
+                                            parent.children.push(new_dir);
+                                            parent.is_sorted = false;
+                                            layout_dirty = true;
+                                        }
+
+                                        // Register newly observed directory into watcher pool
+                                        watcher_mgr.register_dir(&path);
+
+                                        // Spin off deep background recursion worker
+                                        active_scanners.fetch_add(1, Ordering::Release);
+                                        let tx = scan_tx_keep.clone();
+                                        let abort = abort_scan.clone();
+                                        let target = path.clone();
+                                        let scanners = active_scanners.clone();
+                                        thread::spawn(move || {
+                                            scan_directory_recursive(&target, &tx, &abort);
+                                            scanners.fetch_sub(1, Ordering::Release);
+                                        });
+                                    }
+                                } else if meta.is_file() {
+                                    let new_size = meta.len();
+                                    if let Some(diff) =
+                                        root_node.update_file_size(&components, new_size, now)
+                                    {
+                                        if diff != 0 {
+                                            layout_dirty = true;
+                                        }
+                                    } else if let Some(parent) = root_node.find_mut(parent_comps) {
+                                        parent.children.push(FileNode::new(
+                                            item_name.into_owned(),
+                                            false,
+                                            new_size,
+                                        ));
+                                        parent.is_sorted = false;
+                                        layout_dirty = true;
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                Err(e) => {
+                    eprintln!("[Watcher Event Error] {e}");
+                }
             }
         }
 
-        // 3. Debounced Squarified Treemap Execution (Sequential + Zero Allocation logic)
+        // 3. Debounced Squarified Treemap Execution
         let scanning = active_scanners.load(Ordering::Acquire) > 0;
         if layout_dirty && (!scanning || last_layout_time.elapsed().as_millis() > 100) {
             root_node.target_rect = world_canvas;
 
-            // Re-aggregate authoritative file sizes
             let (f_count, b_count) = sum_tree_stats(&mut root_node);
             tree_files = f_count;
             tree_bytes = b_count;
@@ -938,44 +1065,58 @@ async fn main() {
             Color::new(0.15, 0.17, 0.22, 1.0),
         );
 
+        let watcher_alive = watcher_mgr.watcher.is_some() && watcher_mgr.error_msg.is_none();
         let status_color = if scanning {
             Color::new(0.95, 0.8, 0.1, 1.0)
-        } else if watcher_active {
+        } else if watcher_mgr.limit_hit {
+            Color::new(1.0, 0.55, 0.0, 1.0)
+        } else if watcher_alive {
             Color::new(0.2, 0.85, 0.3, 1.0)
         } else {
             Color::new(0.9, 0.2, 0.2, 1.0)
         };
 
         let status_text = if scanning {
-            "SCANNING..."
-        } else if watcher_active {
+            "SCANNING...".to_string()
+        } else if watcher_mgr.limit_hit {
+            format!(
+                "WATCHING (INOTIFY LIMIT: {} DIRS)",
+                watcher_mgr.watched_dirs.len()
+            )
+        } else if watcher_alive {
             #[cfg(target_os = "linux")]
             {
-                "WATCHING (INOTIFY)"
+                format!(
+                    "WATCHING (INOTIFY: {} DIRS)",
+                    watcher_mgr.watched_dirs.len()
+                )
             }
             #[cfg(target_os = "windows")]
             {
-                "WATCHING (ReadDirectoryChangesW)"
+                "WATCHING (ReadDirectoryChangesW)".to_string()
             }
             #[cfg(target_os = "macos")]
             {
-                "WATCHING (FSEvents)"
+                "WATCHING (FSEvents)".to_string()
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
-                "WATCHING (FS API)"
+                "WATCHING (ACTIVE)".to_string()
             }
         } else {
-            "WATCHER FAILED"
+            format!(
+                "WATCHER FAILED: {}",
+                watcher_mgr.error_msg.as_deref().unwrap_or("Unknown error")
+            )
         };
 
-        draw_text(status_text, 14.0, 18.0, 16.0, status_color);
-        draw_text(format!("Files: {}", tree_files), 220.0, 18.0, 16.0, WHITE);
+        draw_text(&status_text, 14.0, 18.0, 15.0, status_color);
+        draw_text(format!("Files: {}", tree_files), 310.0, 18.0, 15.0, WHITE);
         draw_text(
             format!("Size: {}", format_bytes(tree_bytes)),
-            360.0,
+            440.0,
             18.0,
-            16.0,
+            15.0,
             Color::new(0.2, 0.8, 1.0, 1.0),
         );
 
@@ -996,7 +1137,13 @@ async fn main() {
                 14.0,
                 GRAY,
             );
-            draw_text(target_dir.to_string_lossy(), 420.0, 36.0, 14.0, LIGHTGRAY);
+            draw_text(
+                target_dir.to_string_lossy().as_ref(),
+                420.0,
+                36.0,
+                14.0,
+                LIGHTGRAY,
+            );
         }
 
         next_frame().await;
