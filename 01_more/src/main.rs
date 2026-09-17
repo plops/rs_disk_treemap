@@ -6,7 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -353,13 +353,13 @@ pub enum ScanEvent {
     Batch(DirectoryBatch),
 }
 
-fn is_virtual_or_special_fs(path: &Path) -> bool {
+fn is_virtual_or_special_fs(_path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
-        if path.starts_with(Path::new("/proc"))
-            || path.starts_with(Path::new("/sys"))
-            || path.starts_with(Path::new("/dev"))
-            || path.starts_with(Path::new("/run"))
+        if _path.starts_with(Path::new("/proc"))
+            || _path.starts_with(Path::new("/sys"))
+            || _path.starts_with(Path::new("/dev"))
+            || _path.starts_with(Path::new("/run"))
         {
             return true;
         }
@@ -785,21 +785,19 @@ async fn main() {
         let now = Instant::now();
 
         // 1. Drain progressive scan batches from worker thread(s)
-        while let Ok(event) = scan_rx.try_recv() {
-            if let ScanEvent::Batch(mut batch) = event {
-                if let Ok(rel) = batch.parent_path.strip_prefix(&target_dir) {
-                    let components: Vec<&OsStr> = rel.iter().collect();
-                    if let Some(parent) = root_node.find_mut(&components) {
-                        for child in batch.children.drain(..) {
-                            merge_scanned_node(parent, child);
-                        }
-                        layout_dirty = true;
+        while let Ok(ScanEvent::Batch(mut batch)) = scan_rx.try_recv() {
+            if let Ok(rel) = batch.parent_path.strip_prefix(&target_dir) {
+                let components: Vec<&OsStr> = rel.iter().collect();
+                if let Some(parent) = root_node.find_mut(&components) {
+                    for child in batch.children.drain(..) {
+                        merge_scanned_node(parent, child);
                     }
+                    layout_dirty = true;
                 }
             }
         }
 
-        // 2. Drain live file watcher events - Rely completely on platform-backed path reality rather than enum modes
+        // 2. Drain live file watcher events
         while let Ok(change) = watch_rx.try_recv() {
             for path in change.paths {
                 if let Ok(rel) = path.strip_prefix(&target_dir) {
@@ -924,7 +922,11 @@ async fn main() {
         // 6. Non-Overwriting (Zero Allocation) Hover Hit-Detection
         hovered_path_cache.clear();
         let mouse_world = (mouse_screen / camera_zoom) - camera_pos;
-        let hovered_node = find_hovered_path(&root_node, mouse_world, &mut hovered_path_cache);
+        let hovered_node = if mouse_screen.y >= 44.0 {
+            find_hovered_path(&root_node, mouse_world, &mut hovered_path_cache)
+        } else {
+            None
+        };
 
         // 7. Draw HUD
         draw_rectangle(0.0, 0.0, screen_w, 44.0, Color::new(0.06, 0.07, 0.09, 0.95));
@@ -969,9 +971,9 @@ async fn main() {
         };
 
         draw_text(status_text, 14.0, 18.0, 16.0, status_color);
-        draw_text(&format!("Files: {}", tree_files), 220.0, 18.0, 16.0, WHITE);
+        draw_text(format!("Files: {}", tree_files), 220.0, 18.0, 16.0, WHITE);
         draw_text(
-            &format!("Size: {}", format_bytes(tree_bytes)),
+            format!("Size: {}", format_bytes(tree_bytes)),
             360.0,
             18.0,
             16.0,
@@ -995,7 +997,7 @@ async fn main() {
                 14.0,
                 GRAY,
             );
-            draw_text(&target_dir.to_string_lossy(), 420.0, 36.0, 14.0, LIGHTGRAY);
+            draw_text(target_dir.to_string_lossy(), 420.0, 36.0, 14.0, LIGHTGRAY);
         }
 
         next_frame().await;
