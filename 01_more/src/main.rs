@@ -421,6 +421,30 @@ fn scan_directory_recursive(dir_path: &Path, tx: &Sender<ScanEvent>, abort: &Arc
     }
 }
 
+/// Merge one scanned directory batch into the tree.
+/// Shared by `run_headless` and the `gui_main` loop so the merge logic
+/// exists exactly once. Returns true when the tree changed.
+fn merge_scan_batch(
+    root_node: &mut FileNode,
+    target_dir: &Path,
+    batch: &mut DirectoryBatch,
+    watcher_mgr: Option<&mut WatcherManager>,
+) -> bool {
+    if let Some(wm) = watcher_mgr {
+        wm.register_dir(&batch.parent_path);
+    }
+    if let Ok(rel) = batch.parent_path.strip_prefix(target_dir) {
+        let components: Vec<&OsStr> = rel.iter().collect();
+        if let Some(parent) = root_node.find_mut(&components) {
+            for child in batch.children.drain(..) {
+                merge_scanned_node(parent, child);
+            }
+            return true;
+        }
+    }
+    false
+}
+
 fn merge_scanned_node(parent: &mut FileNode, mut new_child: FileNode) {
     if let Some(existing) = parent
         .children
@@ -890,14 +914,7 @@ pub fn run_headless(target_dir: &Path, root_name: &str) -> i32 {
         scan_directory_recursive(&target, &scan_tx, &abort);
     });
     while let Ok(ScanEvent::Batch(mut batch)) = scan_rx.recv() {
-        if let Ok(rel) = batch.parent_path.strip_prefix(target_dir) {
-            let components: Vec<&OsStr> = rel.iter().collect();
-            if let Some(parent) = root_node.find_mut(&components) {
-                for child in batch.children.drain(..) {
-                    merge_scanned_node(parent, child);
-                }
-            }
-        }
+        merge_scan_batch(&mut root_node, target_dir, &mut batch, None);
     }
     let _ = worker.join();
 
@@ -996,17 +1013,15 @@ async fn gui_main() {
 
         // 1. Drain progressive scan batches from worker thread(s)
         while let Ok(ScanEvent::Batch(mut batch)) = scan_rx.try_recv() {
-            // Add directory to watcher pool on non-recursive backends (Linux inotify)
-            watcher_mgr.register_dir(&batch.parent_path);
-
-            if let Ok(rel) = batch.parent_path.strip_prefix(&target_dir) {
-                let components: Vec<&OsStr> = rel.iter().collect();
-                if let Some(parent) = root_node.find_mut(&components) {
-                    for child in batch.children.drain(..) {
-                        merge_scanned_node(parent, child);
-                    }
-                    layout_dirty = true;
-                }
+            // (also registers the dir in the watcher pool on
+            // non-recursive backends such as Linux inotify)
+            if merge_scan_batch(
+                &mut root_node,
+                &target_dir,
+                &mut batch,
+                Some(&mut watcher_mgr),
+            ) {
+                layout_dirty = true;
             }
         }
 
