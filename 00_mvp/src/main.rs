@@ -1,3 +1,6 @@
+// NOTE: Referenz-MVP, eingefroren (Stand 2026-09-18, Review 02).
+// Keine Feature-Arbeit mehr in diesem Crate — Hauptlinie ist `01_more`
+// (Headless-Modus, Live-Watcher, Tests). Siehe plan/20260918_02_review/plan.md.
 use macroquad::prelude::*;
 use std::ffi::OsStr;
 use std::fs;
@@ -120,20 +123,18 @@ fn squarify(nodes: &mut [Node], mut rect: Rect) {
     let mut row = Vec::new();
     let mut row_sum = 0.0;
 
-    for i in 0..nodes.len() {
+    for (i, &area) in areas.iter().enumerate() {
         let side = rect.w.min(rect.h);
         let mut next_row = row.clone();
         next_row.push(i);
 
-        if row.is_empty()
-            || worst(&next_row, row_sum + areas[i], side) <= worst(&row, row_sum, side)
-        {
+        if row.is_empty() || worst(&next_row, row_sum + area, side) <= worst(&row, row_sum, side) {
             row.push(i);
-            row_sum += areas[i];
+            row_sum += area;
         } else {
             layout_row(nodes, &row, row_sum, &mut rect);
             row = vec![i];
-            row_sum = areas[i];
+            row_sum = area;
         }
     }
     if !row.is_empty() {
