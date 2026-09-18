@@ -1329,4 +1329,112 @@ mod tests {
         let args = vec!["treemap-disk-analyzer".to_string()];
         assert_eq!(target_from_args(&args), PathBuf::from("."));
     }
+
+    #[test]
+    fn merge_scan_batch_reports_whether_tree_changed() {
+        let target = PathBuf::from("/tmp/treemap-merge-probe");
+        let mut root = FileNode::new("root".to_string(), true, 0);
+
+        let mut batch = DirectoryBatch {
+            parent_path: target.clone(),
+            children: vec![FileNode::new("a.txt".to_string(), false, 10)],
+        };
+        assert!(merge_scan_batch(&mut root, &target, &mut batch, None));
+        assert_eq!(root.children.len(), 1);
+
+        // Batch for an unknown directory matches nothing.
+        let mut orphan = DirectoryBatch {
+            parent_path: target.join("nope"),
+            children: vec![FileNode::new("b.txt".to_string(), false, 5)],
+        };
+        assert!(!merge_scan_batch(&mut root, &target, &mut orphan, None));
+        assert_eq!(root.children.len(), 1);
+    }
+
+    fn layout_test_tree() -> FileNode {
+        let mut root = FileNode::new("root".to_string(), true, 0);
+        root.target_rect = Rect::new(0.0, 0.0, 1000.0, 1000.0);
+        let mut big = FileNode::new("big".to_string(), true, 0);
+        big.children = vec![
+            FileNode::new("b1".to_string(), false, 400),
+            FileNode::new("b2".to_string(), false, 200),
+        ];
+        root.children = vec![
+            big,
+            FileNode::new("mid".to_string(), false, 300),
+            FileNode::new("small".to_string(), false, 100),
+        ];
+        let _ = sum_tree_stats(&mut root);
+        root
+    }
+
+    #[test]
+    fn layout_conserves_area_sorts_and_avoids_overlap() {
+        let mut root = layout_test_tree();
+        let mut ws = LayoutWorkspace {
+            areas: Vec::new(),
+            row: Vec::new(),
+        };
+        layout_treemap_sequential(&mut root, &mut ws);
+
+        // Sorted descending by size.
+        let sizes: Vec<u64> = root.children.iter().map(|c| c.size_bytes).collect();
+        assert_eq!(sizes, vec![600, 300, 100]);
+
+        // Area conserved (f32 rounding only).
+        let parent_area = root.target_rect.w * root.target_rect.h;
+        let children_area: f32 = root
+            .children
+            .iter()
+            .map(|c| c.target_rect.w * c.target_rect.h)
+            .sum();
+        assert!(
+            (children_area - parent_area).abs() / parent_area < 0.005,
+            "children={children_area} parent={parent_area}"
+        );
+
+        // No pairwise overlap between siblings.
+        for (i, a) in root.children.iter().enumerate() {
+            for b in root.children.iter().skip(i + 1) {
+                let ra = a.target_rect;
+                let rb = b.target_rect;
+                let overlap_x = ra.x < rb.x + rb.w && rb.x < ra.x + ra.w;
+                let overlap_y = ra.y < rb.y + rb.h && rb.y < ra.y + ra.h;
+                assert!(!(overlap_x && overlap_y), "overlap: {ra:?} vs {rb:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scanner_keeps_empty_files_skips_symlinks_and_missing_dirs() {
+        let dir = std::env::temp_dir().join(format!("treemap-scan-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("empty.txt"), []).unwrap();
+        fs::write(dir.join("sub").join("data.bin"), vec![b'y'; 16]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("sub", dir.join("link")).unwrap();
+
+        let (tx, rx) = channel();
+        let abort = Arc::new(AtomicBool::new(false));
+        scan_directory_recursive(&dir, &tx, &abort);
+        drop(tx);
+
+        let mut root = FileNode::new("root".to_string(), true, 0);
+        while let Ok(ScanEvent::Batch(mut batch)) = rx.try_recv() {
+            merge_scan_batch(&mut root, &dir, &mut batch, None);
+        }
+        let (files, bytes) = sum_tree_stats(&mut root);
+        assert_eq!((files, bytes), (2, 16));
+        assert!(root.children.iter().any(|c| c.name == "empty.txt"));
+        assert!(root.children.iter().all(|c| c.name != "link"));
+
+        // Nonexistent path: no batches, no panic.
+        let (tx2, rx2) = channel();
+        scan_directory_recursive(&dir.join("does-not-exist"), &tx2, &abort);
+        drop(tx2);
+        assert!(rx2.try_recv().is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
