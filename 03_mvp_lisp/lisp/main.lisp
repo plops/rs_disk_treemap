@@ -1,0 +1,55 @@
+;; main.lisp --- emitter for the macroquad entry point.
+(in-package :cl-rust-generator)
+(defun emit-main-tree-arm ()
+  `(progn
+     (let ((avail_h (- screen_h 36.0)))
+       (declare (mutable avail_h))
+       (when (< avail_h 1.0) (stmt (= avail_h 1.0)))
+       (let ((canvas (Rect--new 0.0 36.0 screen_w avail_h)))
+         (when (!= (tuple screen_w screen_h) last_size)
+           (= (dot tree rect) canvas)
+           (squarify (ref-mut (dot tree children)) canvas)
+           (= last_size (tuple screen_w screen_h))
+           ,(lprint :msg "layout"
+                    :vars '(screen_w screen_h (dot tree size))))
+         (let ((hovered None))
+           (declare (type "Option<String>" hovered) (mutable hovered))
+           (render_tree tree (Vec2--from (mouse_position)) (ref-mut hovered))
+           (draw_rectangle 0.0 0.0 screen_w 36.0
+                           (Color--new 0.05s0 0.06s0 0.08s0 0.95s0))
+           (let ((header (dot hovered
+                              (unwrap_or_else
+                                (lambda ()
+                                  (format! (string "{}: {}")
+                                           (dot tree path (display))
+                                           (format_bytes (dot tree size))))))))
+             (stmt (draw_text (ref header) 14.0 24.0 16.0 WHITE))))))))
+(defun emit-main ()
+  `(attr "macroquad::main(\"Treemap Disk Visualizer MVP\")"
+     (defun-async main ()
+       (let ((raw_target (dot (std--env--args) (nth 1)
+                              (map (scope PathBuf from))
+                              (unwrap_or_else
+                                (lambda ()
+                                  (PathBuf--from (string "."))))))
+             (target (dot (fs--canonicalize (ref raw_target))
+                          (unwrap_or raw_target)))
+             ((tuple tx rx) ((scope channel (angle Node)))))
+         ,(lprint :msg "target" :vars '((dot target (display))))
+         (thread--spawn "move || { let root = scan_tree(&target); let _ = tx.send(root); }")
+         (let ((root None) (last_size (tuple 0.0 0.0)))
+           (declare (type "Option<Node>" root) (mutable root last_size))
+           (loop
+             (clear_background (Color--new 0.08s0 0.09s0 0.12s0 1.0s0))
+             (let (((tuple screen_w screen_h)
+                    (tuple (screen_width) (screen_height))))
+               (if-let ((Ok loaded_root) (dot rx (try_recv)))
+                 (progn
+                   (= root (Some loaded_root))
+                   (stmt (= last_size (tuple 0.0 0.0)))))
+               (if-let ((Some tree) (ref-mut root))
+                 ,(emit-main-tree-arm)
+                 (stmt (draw_text (string "Scanning filesystem...")
+                                    20.0 40.0 24.0 LIGHTGRAY)))
+               (await (next_frame))))))))
+  )
