@@ -731,11 +731,7 @@ fn render_treemap(
 
         // Text truncation to avoid overlapping neighboring cells
         let max_chars = ((screen_w - 10.0) / 7.2) as usize;
-        let display_label = if label.len() > max_chars && max_chars > 3 {
-            format!("{}..", &label[..max_chars - 2])
-        } else {
-            label
-        };
+        let display_label = truncate_label(&label, max_chars);
 
         draw_text(&display_label, screen_x + 5.0, screen_y + 14.0, 14.0, BLACK);
         draw_text(&display_label, screen_x + 4.0, screen_y + 13.0, 14.0, WHITE);
@@ -766,6 +762,24 @@ fn find_hovered_path<'a>(
 // ============================================================================
 // 6. Formatting & Color Generator
 // ============================================================================
+
+/// Truncate a label to at most `max_chars` characters (Unicode-safe).
+///
+/// The previous implementation sliced `&label[..max_chars - 2]` on byte
+/// indices and panicked on multi-byte chars (e.g. CJK: end byte index 5
+/// inside '还'). This cuts on char boundaries instead and compares the
+/// char count, not the byte length.
+pub fn truncate_label(label: &str, max_chars: usize) -> String {
+    if max_chars <= 3 || label.chars().count() <= max_chars {
+        return label.to_string();
+    }
+    let end = label
+        .char_indices()
+        .nth(max_chars - 2)
+        .map(|(i, _)| i)
+        .unwrap_or(label.len());
+    format!("{}..", &label[..end])
+}
 
 fn get_color_for_filename(name: &str) -> Color {
     let ext = Path::new(name)
@@ -825,17 +839,114 @@ fn window_conf() -> Conf {
 // 7. Main Event Loop
 // ============================================================================
 
-#[macroquad::main(window_conf)]
-async fn main() {
-    let raw_target = std::env::args()
-        .nth(1)
+// ============================================================================
+// 8. Headless Mode (servers, containers and CI without an X server)
+// ============================================================================
+
+/// First non-flag CLI argument is the scan target.
+/// `--headless` / `--scan-only` are flags and never a target path.
+pub fn target_from_args(args: &[String]) -> PathBuf {
+    args.iter()
+        .skip(1)
+        .find(|a| *a != "--headless" && *a != "--scan-only")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn resolve_target(args: &[String]) -> (PathBuf, String) {
+    let raw_target = target_from_args(args);
     let target_dir = fs::canonicalize(&raw_target).unwrap_or(raw_target);
     let root_name = target_dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| target_dir.to_string_lossy().into_owned());
+    (target_dir, root_name)
+}
+
+/// True when a GUI window can plausibly be opened.
+/// On Linux macroquad/miniquad panics with `XOpenDisplay() failed!` when
+/// neither X11 nor Wayland is available, so check before touching the GUI.
+pub fn has_graphical_display() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+            || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Scan `target_dir` synchronously (reuses the GUI scanner) and print a
+/// size-sorted summary to stdout. Returns the process exit code.
+pub fn run_headless(target_dir: &Path, root_name: &str) -> i32 {
+    let mut root_node = FileNode::new(root_name.to_string(), true, 0);
+
+    let (scan_tx, scan_rx) = channel();
+    let abort = Arc::new(AtomicBool::new(false));
+    let target = target_dir.to_path_buf();
+    let worker = thread::spawn(move || {
+        scan_directory_recursive(&target, &scan_tx, &abort);
+    });
+    while let Ok(ScanEvent::Batch(mut batch)) = scan_rx.recv() {
+        if let Ok(rel) = batch.parent_path.strip_prefix(target_dir) {
+            let components: Vec<&OsStr> = rel.iter().collect();
+            if let Some(parent) = root_node.find_mut(&components) {
+                for child in batch.children.drain(..) {
+                    merge_scanned_node(parent, child);
+                }
+            }
+        }
+    }
+    let _ = worker.join();
+
+    let (file_count, total_bytes) = sum_tree_stats(&mut root_node);
+    root_node
+        .children
+        .sort_unstable_by_key(|a| std::cmp::Reverse(a.size_bytes));
+
+    println!(
+        "{}: {} in {} files",
+        root_name,
+        format_bytes(total_bytes),
+        file_count
+    );
+    for child in &root_node.children {
+        let suffix = if child.is_dir { "/" } else { "" };
+        println!(
+            "{}\t{}{}",
+            format_bytes(child.size_bytes),
+            child.name,
+            suffix
+        );
+    }
+    0
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let explicit_headless = args.iter().any(|a| a == "--headless" || a == "--scan-only");
+
+    if explicit_headless || !has_graphical_display() {
+        if !explicit_headless {
+            eprintln!(
+                "No graphical display detected (neither DISPLAY nor WAYLAND_DISPLAY is set); \
+                 running in headless scan mode. Pass --headless to silence this note, or run \
+                 with an X server (e.g. `xvfb-run ./treemap-disk-analyzer <dir>`) for the GUI."
+            );
+        }
+        let (target_dir, root_name) = resolve_target(&args);
+        std::process::exit(run_headless(&target_dir, &root_name));
+    }
+    // NOTE: macroquad::Window::from_config is what #[macroquad::main] expands
+    // to; calling it directly lets the headless check run before miniquad
+    // ever calls XOpenDisplay().
+    macroquad::Window::from_config(window_conf(), gui_main());
+}
+
+async fn gui_main() {
+    let (target_dir, root_name) = resolve_target(&std::env::args().collect::<Vec<_>>());
 
     let mut root_node = FileNode::new(root_name, true, 0);
 
@@ -1147,5 +1258,46 @@ async fn main() {
         }
 
         next_frame().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ascii_label() {
+        assert_eq!(truncate_label("hello world", 8), "hello ..");
+        assert_eq!(truncate_label("hi", 8), "hi");
+        assert_eq!(truncate_label("12345678", 8), "12345678");
+    }
+
+    #[test]
+    fn truncate_cjk_label_never_panics() {
+        // Exact crash from the bug report: byte index 5 of "abc还def"
+        // sits inside '还' (bytes 3..6), which panicked the old slicer.
+        assert_eq!(truncate_label("abc还def", 6), "abc还..");
+        assert_eq!(truncate_label("abc还def", 7), "abc还def");
+        assert_eq!(truncate_label("还还还还还", 4), "还还..");
+    }
+
+    #[test]
+    fn truncate_emoji_and_narrow_width() {
+        assert_eq!(truncate_label("a🦀b", 3), "a🦀b");
+        assert_eq!(truncate_label("a🦀bcd", 4), "a🦀..");
+        assert_eq!(truncate_label("anything", 3), "anything");
+        assert_eq!(truncate_label("anything", 2), "anything");
+    }
+
+    #[test]
+    fn target_arg_parsing_skips_flags() {
+        let args = vec![
+            "treemap-disk-analyzer".to_string(),
+            "--headless".to_string(),
+            "/tmp".to_string(),
+        ];
+        assert_eq!(target_from_args(&args), PathBuf::from("/tmp"));
+        let args = vec!["treemap-disk-analyzer".to_string()];
+        assert_eq!(target_from_args(&args), PathBuf::from("."));
     }
 }
