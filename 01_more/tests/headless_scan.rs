@@ -5,6 +5,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 fn test_binary() -> PathBuf {
     let mut dir = std::env::current_exe().expect("current test exe");
@@ -49,5 +51,34 @@ fn headless_scan_lists_files_and_totals() {
     assert!(stdout.contains("sub/"), "stdout:\n{stdout}");
     assert!(stdout.contains("3 files"), "stdout:\n{stdout}");
     assert!(stdout.contains("180"), "stdout:\n{stdout}"); // 100 + 30 + 50 bytes total
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `binary --headless dir | head -n 1` must not panic with
+/// "failed printing to stdout: Broken pipe": simulate the closed pipe by
+/// dropping the child's stdout handle immediately after spawn.
+#[cfg(unix)]
+#[test]
+fn headless_survives_closed_stdout() {
+    let dir = fixture_dir();
+    let mut child = Command::new(test_binary())
+        .arg("--headless")
+        .arg(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn headless binary");
+    drop(child.stdout.take());
+    let output = child.wait_with_output().expect("wait for binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "binary panicked on closed stdout:\n{stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "exit={} stderr={stderr}",
+        output.status
+    );
     let _ = fs::remove_dir_all(&dir);
 }

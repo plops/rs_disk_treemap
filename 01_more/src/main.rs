@@ -4,6 +4,7 @@ use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -834,6 +835,19 @@ fn get_color_for_filename(name: &str) -> Color {
     }
 }
 
+/// Write a line to stdout, silently tolerating a closed pipe.
+/// `binary --headless dir | head` must not panic with
+/// "failed printing to stdout: Broken pipe (os error 32)".
+fn print_line(line: String) {
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    if let Err(e) = writeln!(lock, "{line}")
+        && e.kind() != io::ErrorKind::BrokenPipe
+    {
+        panic!("failed printing to stdout: {e}");
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const SUFFIXES: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut d = bytes as f64;
@@ -923,20 +937,20 @@ pub fn run_headless(target_dir: &Path, root_name: &str) -> i32 {
         .children
         .sort_unstable_by_key(|a| std::cmp::Reverse(a.size_bytes));
 
-    println!(
+    print_line(format!(
         "{}: {} in {} files",
         root_name,
         format_bytes(total_bytes),
         file_count
-    );
+    ));
     for child in &root_node.children {
         let suffix = if child.is_dir { "/" } else { "" };
-        println!(
+        print_line(format!(
             "{}\t{}{}",
             format_bytes(child.size_bytes),
             child.name,
             suffix
-        );
+        ));
     }
     0
 }
