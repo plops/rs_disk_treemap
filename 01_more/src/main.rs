@@ -219,7 +219,7 @@ fn squarify_children(node: &mut FileNode, ws: &mut LayoutWorkspace) {
 
     if !node.is_sorted {
         node.children
-            .sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            .sort_unstable_by_key(|a| std::cmp::Reverse(a.size_bytes));
         node.is_sorted = true;
     }
 
