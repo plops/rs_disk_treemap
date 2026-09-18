@@ -83,3 +83,44 @@ jobs:
         with:
           # This action will automatically create a release if it doesn't exist for the tag
           files: ${{ matrix.project.dir }}/target/release/${{ matrix.project.bin }}-${{ matrix.os_name }}${{ matrix.ext }}
+
+  smoke:
+    name: Smoke test (linux + xvfb)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies and xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev xvfb
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "01_more -> target"
+
+      - name: fmt, clippy and tests
+        working-directory: 01_more
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Headless smoke
+        working-directory: 01_more
+        run: ./target/debug/treemap-disk-analyzer --headless . | head -n 5
+
+      - name: GUI smoke under xvfb
+        working-directory: 01_more
+        # timeout kills the event loop after 20s: exit 124 means the GUI
+        # was still running (healthy); anything else (e.g. 101 on panic)
+        # fails the job.
+        run: |
+          test "$(timeout 20 xvfb-run -a ./target/debug/treemap-disk-analyzer . >gui.log 2>&1; echo $?)" = "124"
