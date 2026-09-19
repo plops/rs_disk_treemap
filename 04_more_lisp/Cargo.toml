@@ -1,0 +1,15 @@
+[package]
+name = "treemap_more_lisp"
+version = "0.3.0"
+edition = "2024"
+
+[dependencies]
+macroquad = "0.4"
+notify = { version = "6.1", default-features = false, features = ["macos_kqueue"] }
+
+[profile.release]
+opt-level = "z"       # Small binary size (use "3" for maximum layout speed)
+lto = true             # Whole-program Link-Time Optimization
+codegen-units = 1      # Maximizes dead code elimination
+panic = "abort"        # Drops stack unwinding tables
+strip = true           # Automatically strips debug symbols
