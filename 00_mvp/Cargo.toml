@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 macroquad = "0.4"
+
+[profile.release]
+opt-level = "z"       # Small binary size (use "3" for maximum layout speed)
+lto = true             # Whole-program Link-Time Optimization
+codegen-units = 1      # Maximizes dead code elimination
+panic = "abort"        # Drops stack unwinding tables
+strip = true           # Automatically strips debug symbols
