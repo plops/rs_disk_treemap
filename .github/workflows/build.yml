@@ -36,6 +36,10 @@ jobs:
           - dir: 03_mvp_lisp
             name: treemap-lisp
             bin: treemap_lisp
+          # Configuration for the transpiled analyzer (gen.lisp -> main.rs)
+          - dir: 04_more_lisp
+            name: treemap-more-lisp
+            bin: treemap_more_lisp
         include:
           - os: ubuntu-latest
             os_name: linux
@@ -108,7 +112,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "01_more -> target\n03_mvp_lisp -> target"
+          workspaces: "01_more -> target\n03_mvp_lisp -> target\n04_more_lisp -> target"
 
       - name: fmt, clippy and tests
         working-directory: 01_more
@@ -144,3 +148,22 @@ jobs:
         run: |
           test "$(timeout 20 xvfb-run -a ./target/debug/treemap_lisp . >gui03.log 2>&1; echo $?)" = "124"
           grep -q "^target " gui03.log
+
+      - name: fmt, clippy and tests (04_more_lisp)
+        working-directory: 04_more_lisp
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Headless smoke (04_more_lisp)
+        working-directory: 04_more_lisp
+        run: ./target/debug/treemap_more_lisp --headless . | head -n 5
+
+      - name: GUI smoke under xvfb (04_more_lisp)
+        working-directory: 04_more_lisp
+        # Same liveness convention as above: timeout exit 124 is healthy.
+        # The transpiled analyzer logs scan/layout lines (lprint) to stderr.
+        run: |
+          test "$(timeout 20 xvfb-run -a ./target/debug/treemap_more_lisp . >gui04.log 2>&1; echo $?)" = "124"
+          grep -q "^layout " gui04.log
