@@ -835,7 +835,7 @@ fn update_animations(node: &mut FileNode, dt: f32, now: Instant) -> bool {
             still_anim = true
         }
         for child in &mut node.children {
-            still_anim = still_anim || update_animations(child, dt, now)
+            still_anim = update_animations(child, dt, now) || still_anim
         }
         still_anim
     }
@@ -1580,6 +1580,26 @@ fn layout_conserves_area_sorts_and_avoids_overlap() {
                     )
                 }
             }
+        }
+    }
+}
+#[test]
+fn update_animations_advances_all_siblings_in_one_pass() {
+    {
+        let mut root = FileNode::new("root".to_string(), true, 0);
+        root.children = vec![
+            FileNode::new("c1".to_string(), false, 400),
+            FileNode::new("c2".to_string(), false, 200),
+        ];
+        root.children[0].target_rect = Rect::new(2.00e+2, 0.0, 50.0, 50.0);
+        root.children[0].current_rect = Rect::new(0.0, 0.0, 50.0, 50.0);
+        root.children[1].target_rect = Rect::new(0.0, 2.00e+2, 50.0, 50.0);
+        root.children[1].current_rect = Rect::new(0.0, 0.0, 50.0, 50.0);
+        {
+            let still = update_animations(&mut root, 1.60e-2, Instant::now());
+            assert!(still);
+            assert!(0.0 < root.children[0].current_rect.x);
+            assert!(0.0 < root.children[1].current_rect.y)
         }
     }
 }

@@ -50,8 +50,10 @@
          (= (dot node growth_rate) 0.0)
          (= still_anim true)
          )
+       ;; NOTE: call first — `||` short-circuits, so the accumulator
+       ;; comes second (same evaluation order as `|=` in the reference).
        (for (child (ref-mut (dot node children)))
-            (= still_anim (or still_anim (update_animations child dt now)))
+            (= still_anim (or (update_animations child dt now) still_anim))
             )
        still_anim
        )

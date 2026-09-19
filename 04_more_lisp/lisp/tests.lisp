@@ -163,10 +163,49 @@
        )
     )
   )
+(defun emit-animation-sibling-test ()
+  ;; Regression: every sibling must advance in a single update_animations
+  ;; pass, even while an earlier sibling is still animating. `|=` in the
+  ;; reference evaluates the recursive call unconditionally; a short
+  ;; circuiting `||` with the accumulator on the left would freeze all
+  ;; later siblings until the first one converges (visible as slow
+  ;; file-by-file resorting after the diagram first settles).
+  (list
+    "#[test]"
+    `(defun update_animations_advances_all_siblings_in_one_pass ()
+       (let ((root (FileNode--new ,(owned "root") true 0)))
+         (declare (mutable root))
+         (= (dot root children)
+            (vec! (FileNode--new ,(owned "c1") false 400)
+                  (FileNode--new ,(owned "c2") false 200)
+                  )
+            )
+         (= (dot (aref (dot root children) 0) target_rect)
+            (Rect--new 200.0 0.0 50.0 50.0)
+            )
+         (= (dot (aref (dot root children) 0) current_rect)
+            (Rect--new 0.0 0.0 50.0 50.0)
+            )
+         (= (dot (aref (dot root children) 1) target_rect)
+            (Rect--new 0.0 200.0 50.0 50.0)
+            )
+         (= (dot (aref (dot root children) 1) current_rect)
+            (Rect--new 0.0 0.0 50.0 50.0)
+            )
+         (let ((still (update_animations (ref-mut root) 1.60e-2 (Instant--now))))
+           (assert! still)
+           (assert! (< 0.0 (dot (dot (aref (dot root children) 0) current_rect) x)))
+           (assert! (< 0.0 (dot (dot (aref (dot root children) 1) current_rect) y)))
+           )
+         )
+       )
+    )
+  )
 (defun emit-layout-test ()
   (append
     (emit-layout-test-tree)
     (emit-layout-overlap-test)
+    (emit-animation-sibling-test)
     )
   )
 (defun emit-tests ()
