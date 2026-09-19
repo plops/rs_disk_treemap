@@ -1,0 +1,47 @@
+du arbeitest im auftrag von wol pumba (wolpumba@gmail.com)
+
+konvertiere den rust code von 01_more nach 04_more_lisp. du musst eine gen.lisp datei schreiben, so aehnlich wie /workspace/src/cl-rust-generator/examples/21_mandelbrot/gen00.lisp bzw das program 03_mvp_lisp was mit diesem plan erstellt wurde 20260918_03_transpile_mvp/walkthrough.md
+dann kannst du diese mit sbcl ausfuehren, um mittels transpiler rust code zu erzeugen.
+
+die common-lisp-aehnliche transpiler input sprache ist hier erklaert: /workspace/src/cl-rust-generator/SUPPORTED_FORMS.md
+
+ich habe noch kein freistehendes (nicht im cl-rust-generator definiertes) beispiel. hier ist transpiler input fuer einen lisp-to-c++ transpiler: gen-cpp-freestanding-example.lisp
+du kannst vermutlich so aehnlich vorgehen:
+$ sbcl --load gen-cpp-freestanding-example.lisp  -c quit --noinform
+This is SBCL 2.6.7, [...]
+; Loading "cl-cpp-generator2"
+.........................
+write code into file: '/home/kiel/output.cpp'
+
+
+mit dem setzen von klammern musst du wirklich vorsichtig sein!
+nutze das tool /workspace/src/parenmedic/zig-out/bin/parenmedic um klammern oft zu checken und zu fixen.
+wenn du dich vertust, dann ist es sehr schwierig den fehler zu korrigieren. besser ist es vor einer aenderung ein (known-good) backup zu machen und zu diesem zurueck zu gehen, falls es fehler mit klammern gibt. 
+i suggest that you should write
+  functions that are no longer than 60 lines, you can have several such functions in a file but they should be at the top level or with closing parens on individual lines. this allows me to check the parens in emacs by looking at the highlighted matches on the screen. for parens outside of
+  functions (like `(do0 ..) or other top level stuff ) place closing parens on individual lines
+
+
+du kannst xvfb fuer tests nutzen, siehe 20260918_02_review_and_xvfb_test/walkthrough.md fuer details
+
+
+nutze tools um konsistenten und aufgeraeumten quellcode zu gewaehrleisten. ich moechte den code und die abhaengigkeiten moeglichst klein halten.
+
+
+Schaue dir den Quellcode an und die Architektur dieser Software an. Nutze deepwiki mcp fuer plops/rs_disk_treemap um dokumentation zu bekommen und fragen beantworten zu lassen. falls abhaengigkeiten eingefuehrt werden sind diese mitsamt ihrer github organisation in deps.md aufzuschreiben, so dass wir spaeter einfach die deepwiki abfragen konstruieren koennen. nutze rust tools um auf die neueste vorhandene version zu switchen (auch wenn vor kompatibilitaet gewarnt wird, wenn wir gerade eine dependency einfuehren ist es wichtig, die neueste version zu nehmen) und schon vorab usage examples in den plan aufzunehmen (mit deepwiki mcp zu erfragen)
+
+du befindest dich in einem docker container, basierend auf ubuntu 26. du darfst neue programme installieren, falls noetig. 
+
+Schlage vor, wie wir dieses Feature implementieren können. Habe ich alle Requirements aufgelistet, die wichtig sind, oder kannst du dir vorstellen, dass noch andere Dinge werden sollen? Liste mir diese auf Vorschlägen, was man am besten umsetzen könnte.
+
+Schreibe einen Implementierungsplan. Dieser Implementierungsplan soll einen unabhängigen AI-Agenten dazu befähigen, selbstständig einen Kontext aufzubauen, der die wesentlichen
+quellen beinhaltet. Das heißt, der Implementierungsplan hat eine Liste von Dateien, die sich der Agent sich anschauen sollte, mit einer kurzen Beschreibung für jede Datei.
+Weiterhin soll der Implementierungsplan eine Erklärung Commit Messages sendet werden sollen. Und zwar sollen diese mit einer umfassenden Beschreibung und als Conventional Commit format ausgeführt werden.
+
+Neue Unit-Tests und Integration-Tests sollen wie erforderlich eingeführt werden.
+Diese sollen auch ausgeführt werden.
+
+schreibe task.md wo du die implementierungs und test schritte aufeinander abfolgen laesst, so dass ein agent die tasks seriell abarbeiten kann und die arbeit in jedem schritt getested und validiert wird.
+
+Nach der vollständigen Implementierung, wenn alle Tests abgeschlossen sind und alles committed ist, soll auch ein Walkthrough-Dokument entgeschrieben werden und 
+in plan/2026.../walkthrough.md abgelegt werden. Dieses soll zusammenfassen, was wirklich implementiert wurde, welche Stellen aufgrund der Tests oder wie auch immer gemacht wurden, als im Untergrund auch Learnings und mögliche Erweiterungen. liste auch die neuen programme die mit in den docker container aufgenommen werden sollten 
